@@ -502,8 +502,10 @@ fn current_session_cursors(
             .with_context(|| format!("query OpenCode event sequences in {}", path.display()))?;
         for row in rows {
             let (session_id, sequence) = row?;
-            let sequence = nonnegative_cursor(sequence)
-                .with_context(|| format!("session `{session_id}` has invalid event sequence"))?;
+            // OpenCode uses -1 before the first event; keep it distinct from sequence 0.
+            if sequence < -1 {
+                bail!("session `{session_id}` has invalid event sequence: {sequence} is below -1");
+            }
             cursors.entry(session_id).or_default().event_sequence = Some(sequence);
         }
     }
@@ -2793,6 +2795,95 @@ mod tests {
                 assert_eq!(cursor.event_sequence, None);
                 assert!(scan.dirty_session_ids.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn v2_empty_session_event_sequence_tracks_first_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = v2_fixture(&path);
+        insert_v2_session(&connection, "s_child", None, "/repo", 1, 1);
+        connection
+            .execute_batch(
+                "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+                 INSERT INTO event_sequence VALUES ('s_child', -1);",
+            )
+            .unwrap();
+
+        let initial = scan_database(&path, None).unwrap();
+        assert_eq!(initial.dirty_session_ids, vec!["s_child"]);
+        assert_eq!(
+            initial.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                event_sequence: Some(-1),
+                ..Default::default()
+            }
+        );
+        assert!(
+            parse_database_session(&path, "s_child", 0, &AtomicU64::new(1))
+                .unwrap()
+                .is_empty()
+        );
+        let serialized = serde_json::to_string(&state_from_scan(&initial)).unwrap();
+        let previous = serde_json::from_str::<OpencodeDatabaseState>(&serialized).unwrap();
+        assert_eq!(previous, state_from_scan(&initial));
+        assert!(
+            scan_database(&path, Some(&previous))
+                .unwrap()
+                .dirty_session_ids
+                .is_empty()
+        );
+
+        // The first event must invalidate the cursor even without a message projection change.
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 's_child'",
+                [],
+            )
+            .unwrap();
+        let changed = scan_database(&path, Some(&previous)).unwrap();
+        assert_eq!(changed.dirty_session_ids, vec!["s_child"]);
+        assert_eq!(
+            changed.session_cursors["s_child"],
+            OpencodeSessionCursor {
+                event_sequence: Some(0),
+                ..Default::default()
+            }
+        );
+        assert!(
+            scan_database(&path, Some(&state_from_scan(&changed)))
+                .unwrap()
+                .dirty_session_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v2_event_sequence_below_empty_sentinel_is_rejected() {
+        for sequence in [-2, i64::MIN] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("opencode.db");
+            let connection = v2_fixture(&path);
+            insert_v2_session(&connection, "s_child", None, "/repo", 1, 1);
+            connection
+                .execute_batch(
+                    "CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO event_sequence VALUES ('s_child', ?1)",
+                    [sequence],
+                )
+                .unwrap();
+
+            let error = scan_database(&path, None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("s_child` has invalid event sequence")
+            );
         }
     }
 

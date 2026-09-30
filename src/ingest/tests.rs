@@ -1929,6 +1929,9 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
             seq INTEGER NOT NULL, time_created INTEGER NOT NULL,
             time_updated INTEGER NOT NULL, data TEXT NOT NULL
          );
+         CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+         INSERT INTO session_v2 VALUES ('s_empty', NULL, '/repo/v2', 1, 1);
+         INSERT INTO event_sequence VALUES ('s_empty', -1);
          INSERT INTO session_v2 VALUES ('s_v2only', NULL, '/repo/v2', 1, 200);
          INSERT INTO session_message VALUES ('sm_user', 's_v2only', 'user', 1, 100, 100, '{\"text\":\"v2 only queryable\"}');
          INSERT INTO session_message VALUES ('sm_assistant', 's_v2only', 'assistant', 2, 200, 200, '{\"content\":[{\"type\":\"text\",\"text\":\"assistant reply\"},{\"type\":\"tool\",\"name\":\"bash\",\"state\":{\"input\":{\"cmd\":\"ls\"},\"metadata\":{\"output\":\"ok\"}}}]}');",
@@ -1944,6 +1947,12 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
 
     let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
     assert_eq!(first.expect("initial v2 ingest").records_added, 3);
+    assert!(
+        index
+            .records_by_session_id("s_empty")
+            .expect("empty session records")
+            .is_empty()
+    );
     let records = index
         .records_by_session_id("s_v2only")
         .expect("v2-only records");
@@ -1979,6 +1988,19 @@ fn opencode_v2_dispatch_hydrates_v2_only_session_and_rescan_is_noop() {
             .atomic_read(Path::new("meta.json"))
             .unwrap()
     );
+
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "UPDATE event_sequence SET seq = 0 WHERE aggregate_id = 's_empty';
+         INSERT INTO session_message VALUES ('sm_first', 's_empty', 'user', 0, 300, 300, '{\"text\":\"first message queryable\"}');",
+    )
+    .unwrap();
+    drop(db);
+    let third = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+    assert_eq!(third.expect("first message ingest").records_added, 1);
+    let records = index.records_by_session_id("s_empty").unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].text, "first message queryable");
 }
 
 #[test]
