@@ -38,10 +38,17 @@ pub(super) enum IndexCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Show index statistics and storage paths
+    /// Show index statistics, vector state, and indexing config
+    #[command(
+        after_help = "EXAMPLES:\n    memex index stats\n    memex index stats --format json --pretty"
+    )]
     Stats {
+        #[arg(long, hide = true)]
+        json: bool,
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -115,7 +122,7 @@ impl Commands {
                 },
                 IndexCommand::Compact { root } => Self::IndexCompact { root },
                 IndexCommand::Embed { model, root } => Self::Embed { model, root },
-                IndexCommand::Stats { root } => Self::Stats { root },
+                IndexCommand::Stats { json, root, output } => Self::Stats { json, root, output },
             },
             Self::Web {
                 action: Some(action),

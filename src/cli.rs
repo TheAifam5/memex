@@ -11,7 +11,7 @@ use crate::machine::{
     federated_sessions, federated_usage, read_context, read_memory, read_record,
     read_session_pages, session_page_context,
 };
-use crate::memory::{MemoryFreshness, MemoryStore};
+use crate::memory::MemoryStore;
 use crate::memory_search::{
     MAX_MEMORY_READ_CHARS, MemoryReadRequest, MemoryReadValue, MemorySearchMode,
     MemorySearchOptions, embed_memory, gc_memory_vectors,
@@ -30,7 +30,6 @@ use crate::transfer::{
 use crate::tui;
 use crate::types::{RecordLinks, SourceFilter};
 use crate::usage::{CostMode, UsageQuery, scan_usage};
-use crate::vector::VectorIndex;
 use crate::watch::WatchMode;
 use crate::watch::{WatchService, watch_roots};
 use anyhow::{Context, Result, anyhow};
@@ -54,6 +53,7 @@ use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod daemon_upgrade;
+mod stats;
 mod surface;
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
@@ -716,12 +716,17 @@ EXAMPLES:
         #[command(subcommand)]
         action: HerdrCommand,
     },
-    /// Show index statistics (document count, vector count, storage paths)
+    /// Show index statistics, vector state, and indexing config
     #[command(hide = true)]
     Stats {
+        /// Output stats as JSON (legacy alias for --format json --pretty)
+        #[arg(long, hide = true)]
+        json: bool,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Reconstruct local token usage from agent logs
     #[command(after_help = "\
@@ -1932,8 +1937,11 @@ pub fn run() -> Result<()> {
                 run_herdr_resume(Some(session_id), None, false, source, root)?;
             }
         },
-        Commands::Stats { root } => {
-            run_stats(root)?;
+        Commands::Stats { json, root, output } => {
+            stats::run(
+                root,
+                output.resolve(OutputFormat::Text, json.then_some(OutputFormat::Json), json)?,
+            )?;
         }
         Commands::Usage {
             source,
@@ -4969,32 +4977,6 @@ fn hydrate_session_records(
     Ok(records)
 }
 
-fn run_stats(root: Option<PathBuf>) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let memory = MemoryStore::new(paths.root.join("memory/documents.json")).load()?;
-    let memory_sections = memory
-        .documents
-        .iter()
-        .map(|document| document.sections.len())
-        .sum::<usize>();
-    let stale_memories = memory
-        .documents
-        .iter()
-        .filter(|document| matches!(document.freshness, MemoryFreshness::Stale { .. }))
-        .count();
-    println!("index: {}", paths.index.display());
-    println!("documents: {}", index.doc_count()?);
-    if let Some(status) = crate::vector_backfill::status(&paths)? {
-        println!("{}", status.line());
-    }
-    println!("memory documents: {}", memory.documents.len());
-    println!("memory sections: {memory_sections}");
-    println!("stale memory documents: {stale_memories}");
-    print_vector_stats(&paths.vectors)?;
-    Ok(())
-}
-
 struct UsageCommandOptions {
     source: Option<SourceFilter>,
     origin: SessionOrigin,
@@ -5794,27 +5776,6 @@ fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
     println!("documents: {}", index.doc_count()?);
     println!("sessions: {}", store.session_count()?);
     Ok(())
-}
-
-fn print_vector_stats(vectors_dir: &std::path::Path) -> Result<()> {
-    println!("{}", vector_stats_line(vectors_dir)?);
-    Ok(())
-}
-
-fn vector_stats_line(vectors_dir: &std::path::Path) -> Result<String> {
-    let Some(inventory) = VectorIndex::inventory(vectors_dir)? else {
-        return Ok("vectors: none".to_string());
-    };
-    let model = inventory.model.as_deref().unwrap_or("unknown");
-    Ok(format!(
-        "vectors: {} (dims {}, model {}, ids {}, usearch.index {}, doc_ids.bin {})",
-        inventory.vector_count,
-        inventory.dimensions,
-        model,
-        inventory.doc_ids.len(),
-        inventory.index_bytes,
-        inventory.ids_bytes
-    ))
 }
 
 const MEMEX_SEARCH_SKILL: &str = include_str!("../skills/memex-search/SKILL.md");
@@ -9894,33 +9855,6 @@ arguments = {
         );
         let mcp = DaemonMcpArgs::default().resolve(&restarted).unwrap();
         assert_eq!(mcp.listen, mcp_listen);
-    }
-
-    fn make_vector(dims: usize) -> Vec<f32> {
-        (0..dims).map(|i| (i as f32).sin()).collect()
-    }
-
-    #[test]
-    fn vector_stats_line_reports_current_usearch_store() {
-        let tmp = TempDir::new().unwrap();
-        let mut index = VectorIndex::open_or_create(tmp.path(), 64, Some("bge")).unwrap();
-        index.add(42, &make_vector(64)).unwrap();
-        index.save().unwrap();
-
-        let line = vector_stats_line(tmp.path()).unwrap();
-
-        assert!(line.starts_with("vectors: 1 (dims 64, model bge, ids 1,"));
-        assert!(line.contains("usearch.index"));
-        assert!(line.contains("doc_ids.bin"));
-        assert!(!line.contains("vectors.f32"));
-        assert!(!line.contains("doc_ids.u64"));
-    }
-
-    #[test]
-    fn vector_stats_line_reports_none_without_vector_store() {
-        let tmp = TempDir::new().unwrap();
-
-        assert_eq!(vector_stats_line(tmp.path()).unwrap(), "vectors: none");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::vector::{VectorIndex, VectorInventory};
 use anyhow::{Context, Result, anyhow};
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::io::IsTerminal;
@@ -17,7 +18,7 @@ const NON_TTY_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const EMBED_MAX_CHARS: usize = 8192;
 const BACKFILL_DB: &str = "embed-backfill.sqlite3";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackfillStatus {
     pub model: String,
     pub dimensions: usize,
