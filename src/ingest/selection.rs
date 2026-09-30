@@ -35,6 +35,7 @@ enum Shape {
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 struct Root {
@@ -145,6 +146,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
                 .map(|root| Root::new(root, Shape::Zcode)),
         );
     }
+    if options.include_kilocode {
+        roots.extend(
+            sources::kilocode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Kilocode)),
+        );
+    }
     roots
 }
 
@@ -253,6 +261,15 @@ fn classify(root: &Root, path: &Path) -> Match {
                 Match::Ignore
             };
         }
+        Shape::Kilocode => {
+            // One store per data root; `resolve` routes WAL and shared-memory
+            // sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "kilo.db" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
         Shape::Antigravity => {
             let in_profile = parts.first().is_some_and(|part| {
                 *part == "antigravity-cli"
@@ -339,6 +356,16 @@ fn resolve(
                     .filter(|name| *name == "db.sqlite")
                     .map(|name| path.with_file_name(name))
                     .unwrap_or(path),
+                Shape::Kilocode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "kilo.db")
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path),
                 _ => path,
             };
             if excluder.is_excluded(&path) {
@@ -398,6 +425,8 @@ fn resolve(
                         SourceKind::Bob
                     } else if matches!(root.shape, Shape::Zcode) {
                         SourceKind::Zcode
+                    } else if matches!(root.shape, Shape::Kilocode) {
+                        SourceKind::Kilocode
                     } else {
                         SourceKind::Opencode
                     };
@@ -514,6 +543,7 @@ mod tests {
             include_antigravity: false,
             include_bob: false,
             include_zcode: false,
+            include_kilocode: false,
             include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,

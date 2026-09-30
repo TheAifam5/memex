@@ -64,7 +64,11 @@ pub(super) fn classify_file(
     // so none can resume from a byte offset.
     if matches!(
         source,
-        SourceKind::Jcode | SourceKind::Antigravity | SourceKind::Bob | SourceKind::Zcode
+        SourceKind::Jcode
+            | SourceKind::Antigravity
+            | SourceKind::Bob
+            | SourceKind::Zcode
+            | SourceKind::Kilocode
     ) {
         FileChange::Replaced
     } else {

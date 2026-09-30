@@ -395,6 +395,30 @@ impl CheckpointReader {
         }
     }
 
+    /// Read indexed KiloCode ownership entries, like the ZCode inventory above.
+    pub(crate) fn kilocode_database_paths(&self) -> Result<HashSet<String>> {
+        match &self.backend {
+            Backend::Legacy(_) => Ok(HashSet::new()),
+            Backend::Sqlite { connection, .. } => {
+                let indexed: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='index' AND name='files_kilocode_database')",
+                    [], |row| row.get(0),
+                )?;
+                if !indexed {
+                    return Ok(HashSet::new());
+                }
+                let mut statement = connection.prepare(
+                    "SELECT DISTINCT json_extract(payload, '$.identity.kilocode_database')
+                     FROM files INDEXED BY files_kilocode_database
+                     WHERE json_extract(payload, '$.identity.kilocode_database') IS NOT NULL",
+                )?;
+                Ok(statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            }
+        }
+    }
+
     pub(crate) fn has_files_excluding(&self, excluded: &HashSet<String>) -> Result<bool> {
         crate::profiling::count!("state.checkpoint.key_scans", 1);
         match &self.backend {
@@ -451,6 +475,7 @@ impl CheckpointReader {
                         } else {
                             file.identity
                                 .zcode_database
+                                .or(file.identity.kilocode_database)
                                 .or(file.identity.bob_database)
                                 .or_else(|| {
                                     crate::sources::bob::split_virtual_path(Path::new(&path)).map(

@@ -75,6 +75,7 @@ pub struct IngestOptions {
     pub include_antigravity: bool,
     pub include_bob: bool,
     pub include_zcode: bool,
+    pub include_kilocode: bool,
     pub include_kiro: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,

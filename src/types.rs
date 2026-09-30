@@ -21,10 +21,11 @@ pub enum SourceKind {
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 16] = [
+    pub const ALL: [SourceKind; 17] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -41,6 +42,7 @@ impl SourceKind {
         SourceKind::Bob,
         SourceKind::Zcode,
         SourceKind::Kiro,
+        SourceKind::Kilocode,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -62,6 +64,7 @@ impl SourceKind {
             SourceKind::Bob => 13,
             SourceKind::Zcode => 14,
             SourceKind::Kiro => 15,
+            SourceKind::Kilocode => 16,
         }
     }
 
@@ -83,6 +86,7 @@ impl SourceKind {
             13 => Some(SourceKind::Bob),
             14 => Some(SourceKind::Zcode),
             15 => Some(SourceKind::Kiro),
+            16 => Some(SourceKind::Kilocode),
             _ => None,
         }
     }
@@ -105,6 +109,7 @@ impl SourceKind {
             SourceKind::Bob => "bob",
             SourceKind::Zcode => "zcode",
             SourceKind::Kiro => "kiro",
+            SourceKind::Kilocode => "kilocode",
         }
     }
 
@@ -126,6 +131,7 @@ impl SourceKind {
             SourceKind::Bob => "bob",
             SourceKind::Zcode => "zcode",
             SourceKind::Kiro => "kiro",
+            SourceKind::Kilocode => "kilocode",
         }
     }
 
@@ -151,6 +157,7 @@ impl SourceKind {
             "bob" => Some(SourceKind::Bob),
             "zcode" => Some(SourceKind::Zcode),
             "kiro" => Some(SourceKind::Kiro),
+            "kilocode" => Some(SourceKind::Kilocode),
             _ => None,
         }
     }
@@ -177,6 +184,7 @@ pub enum SourceFilter {
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 impl SourceFilter {
@@ -198,6 +206,7 @@ impl SourceFilter {
             SourceFilter::Bob => source == SourceKind::Bob,
             SourceFilter::Zcode => source == SourceKind::Zcode,
             SourceFilter::Kiro => source == SourceKind::Kiro,
+            SourceFilter::Kilocode => source == SourceKind::Kilocode,
         }
     }
 
@@ -219,6 +228,7 @@ impl SourceFilter {
             SourceFilter::Bob => &["bob"],
             SourceFilter::Zcode => &["zcode"],
             SourceFilter::Kiro => &["kiro"],
+            SourceFilter::Kilocode => &["kilocode"],
         }
     }
 
@@ -240,6 +250,7 @@ impl SourceFilter {
             SourceFilter::Bob => "bob",
             SourceFilter::Zcode => "zcode",
             SourceFilter::Kiro => "kiro",
+            SourceFilter::Kilocode => "kilocode",
         }
     }
 }

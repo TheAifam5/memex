@@ -66,6 +66,8 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         // ZCode sessions resume in the desktop app, not a CLI.
         SourceKind::Zcode => None,
         SourceKind::Kiro => None,
+        // KiloCode sessions resume with `kilo --session <id>` in a project directory.
+        SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -109,6 +111,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "bob" if remote || find_in_path("bob").is_some() => {
             Some("cd {cwd_shell} && bob --resume {session_id}".to_string())
+        }
+        "kilocode" if remote || find_in_path("kilo").is_some() => {
+            Some("cd {cwd_shell} && kilo --session {session_id}".to_string())
         }
         _ => None,
     }

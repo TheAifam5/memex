@@ -1471,6 +1471,11 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
+    if source == SourceKind::Kilocode
+        && let Some(cwd) = crate::sources::kilocode::session_cwd(Path::new(source_path), session_id)
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
@@ -2149,6 +2154,15 @@ fn extract_session_label(
         SourceKind::Zcode => {
             if let Some(title) =
                 crate::sources::zcode::session_title(Path::new(source_path), session_id)
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Kilocode => {
+            if let Some(title) =
+                crate::sources::kilocode::session_title(Path::new(source_path), session_id)
             {
                 title
             } else {

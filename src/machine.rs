@@ -3095,6 +3095,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_antigravity: true,
         include_bob: true,
         include_zcode: true,
+        include_kilocode: true,
         include_kiro: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),

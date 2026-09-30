@@ -72,6 +72,7 @@ tool. **Import into** creates a conversation in another tool using the
 | Antigravity | Yes | No | Yes | No | No |
 | IBM Bob | Yes | Yes | Yes | No | No |
 | ZCode | Yes | Yes | No | No | No |
+| KiloCode CLI | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | No | Yes | No | No | No |
 
@@ -82,6 +83,8 @@ tool. **Import into** creates a conversation in another tool using the
   ZCode reads `~/.zcode/cli/db/db.sqlite`, which its SSH-attached runtimes also
   write on remote hosts; `ZCODE_HOME` (comma-separated) indexes extra stores.
   Kiro reads `~/.kiro/sessions`; set `KIRO_SESSIONS_DIR` for copied sessions.
+  KiloCode CLI reads `~/.local/share/kilo/kilo.db` (`$XDG_DATA_HOME/kilo/kilo.db`);
+  set `KILO_DATA_DIR` (comma-separated) to index extra stores.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes support reads usage counters
   and metadata only, not message content. Copilot usage requires local OpenTelemetry

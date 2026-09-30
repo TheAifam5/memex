@@ -420,6 +420,7 @@ enum SourceChoice {
     Bob,
     Zcode,
     Kiro,
+    Kilocode,
 }
 
 impl SourceChoice {
@@ -441,7 +442,8 @@ impl SourceChoice {
             SourceChoice::Antigravity => SourceChoice::Bob,
             SourceChoice::Bob => SourceChoice::Zcode,
             SourceChoice::Zcode => SourceChoice::Kiro,
-            SourceChoice::Kiro => SourceChoice::All,
+            SourceChoice::Kiro => SourceChoice::Kilocode,
+            SourceChoice::Kilocode => SourceChoice::All,
         }
     }
 
@@ -464,6 +466,7 @@ impl SourceChoice {
             SourceChoice::Bob => Some(SourceFilter::Bob),
             SourceChoice::Zcode => Some(SourceFilter::Zcode),
             SourceChoice::Kiro => Some(SourceFilter::Kiro),
+            SourceChoice::Kilocode => Some(SourceFilter::Kilocode),
         }
     }
 
@@ -486,6 +489,7 @@ impl SourceChoice {
             SourceChoice::Bob => "bob",
             SourceChoice::Zcode => "zcode",
             SourceChoice::Kiro => "kiro",
+            SourceChoice::Kilocode => "kilocode",
         }
     }
 
@@ -507,6 +511,7 @@ impl SourceChoice {
             SourceKind::Bob => SourceChoice::Bob,
             SourceKind::Zcode => SourceChoice::Zcode,
             SourceKind::Kiro => SourceChoice::Kiro,
+            SourceKind::Kilocode => SourceChoice::Kilocode,
         }
     }
 }
@@ -1174,6 +1179,7 @@ impl App {
                     include_antigravity: true,
                     include_bob: true,
                     include_zcode: true,
+                    include_kilocode: true,
                     include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
@@ -2699,6 +2705,7 @@ impl App {
             SourceKind::Antigravity => "antigravity",
             SourceKind::Bob => "bob",
             SourceKind::Zcode => "zcode",
+            SourceKind::Kilocode => "kilocode",
             SourceKind::Kiro => "kiro",
         };
         let source_path = session.source_path.clone();
@@ -4176,6 +4183,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Antigravity => label == "antigravity",
         SourceChoice::Bob => label == "bob",
         SourceChoice::Zcode => label == "zcode",
+        SourceChoice::Kilocode => label == "kilocode",
         SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
@@ -4198,6 +4206,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Antigravity => Color::Rgb(120, 200, 140),
         SourceKind::Bob => Color::Rgb(100, 150, 255),
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
+        SourceKind::Kilocode => Color::Rgb(255, 122, 189),
         SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }

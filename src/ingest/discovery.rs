@@ -325,6 +325,15 @@ fn journal_hints(
                         .filter(|database| database.is_file()),
                 );
             }
+            // KiloCode writes the same way: WAL-only commits leave no checkpoint
+            // to sweep from until the first full index sees the store.
+            if options.include_kilocode {
+                paths.extend(
+                    crate::sources::kilocode::db_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -426,6 +435,7 @@ pub(super) fn file_identity(
         source_metadata_sha256: None,
         bob_database: None,
         zcode_database: None,
+        kilocode_database: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -474,6 +484,7 @@ pub(super) fn prepare_file_task(
         .unwrap_or_else(|| file_identity(&path, metadata, prefix_bytes));
     if (source == SourceKind::Antigravity && crate::sources::antigravity::is_db_path(&path))
         || source == SourceKind::Zcode
+        || source == SourceKind::Kilocode
     {
         identity.sqlite_wal = Some(crate::state::SqliteWalIdentity::read(&path));
     }
@@ -945,6 +956,128 @@ fn zcode_database_owns(database: &Path, key: &str) -> bool {
     is_legacy_database_checkpoint
         || crate::sources::zcode::split_virtual_path(Path::new(key))
             .is_some_and(|(owner, _)| owner == database)
+}
+
+/// KiloCode sessions own independent checkpoints. Hash conversation rows rather than
+/// the database/WAL so accounting-only commits never schedule transcript replay.
+pub(super) fn discover_kilocode(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
+    if !options.include_kilocode {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files.iter().map(|file| file.path.clone()).collect(),
+        None => crate::sources::kilocode::roots()
+            .into_iter()
+            .map(|root| root.join("kilo.db"))
+            .collect::<Vec<_>>(),
+    };
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Kilocode, options.include_reasoning);
+    for database in databases {
+        let alias = database.canonicalize().ok();
+        let excluded = excluder.is_excluded(&database)
+            || alias
+                .as_ref()
+                .is_some_and(|path| excluder.is_excluded(path));
+        let absent = database.metadata().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::NotFound
+                && database.parent().is_some_and(Path::is_dir)
+        });
+        let sessions = if excluded || absent {
+            Vec::new()
+        } else {
+            match crate::sources::kilocode::enumerate_sessions(&database) {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    result
+                        .diagnostics
+                        .unreadable_sources
+                        .push(database.to_string_lossy().into_owned());
+                    result.unreadable_databases.push(database);
+                    result.files_skipped += 1;
+                    continue;
+                }
+            }
+        };
+        let mut current = HashSet::new();
+        let keys = sessions
+            .iter()
+            .map(|session| {
+                crate::sources::kilocode::virtual_path(&database, &session.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        for (session, key) in sessions.into_iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            if excluder.is_excluded(&path)
+                || alias.as_ref().is_some_and(|alias| {
+                    excluder
+                        .is_excluded(&crate::sources::kilocode::virtual_path(alias, &session.id))
+                })
+            {
+                result.files_skipped += 1;
+                continue;
+            }
+            current.insert(key.clone());
+            result.files_scanned += 1;
+            result.total_bytes += session.size;
+            let identity = FileIdentity {
+                kilocode_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(session.fingerprint),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let change = plan::classify_file(
+                SourceKind::Kilocode,
+                session.size,
+                0,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Kilocode,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size: session.size,
+                mtime: 0,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+            });
+        }
+        // Reconcile only after a successful inventory (or confirmed removal).
+        // The raw database key is the pre-session-scoped checkpoint; replace it once.
+        let database_key = database.to_string_lossy().into_owned();
+        for key in state.file_keys()? {
+            let owned = key == database_key
+                || crate::sources::kilocode::split_virtual_path(Path::new(&key))
+                    .is_some_and(|(owner, _)| owner == database);
+            if owned && !current.contains(&key) {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
 }
 
 pub(super) fn discover_opencode(
@@ -1500,10 +1633,11 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
-        // Bob and ZCode virtual paths sit "under" a database file, never under a walked directory.
+        // Bob, ZCode, and KiloCode virtual paths sit "under" a database file, never under a walked directory.
         let known = known.into_iter().filter(|key| {
             !crate::sources::bob::matches_path(key)
                 && crate::sources::zcode::split_virtual_path(Path::new(key)).is_none()
+                && crate::sources::kilocode::split_virtual_path(Path::new(key)).is_none()
         });
         Some((
             directories::StampedWalk::new(previous, known.map(PathBuf::from)),
@@ -1550,19 +1684,23 @@ pub(super) fn prepare_refresh(
     }
 
     // Route narrowed refreshes to the owning database adapter.
-    let (bob_selected, zcode_selected, opencode_selected) = match selected.as_ref() {
-        Some((_, databases)) => {
-            let (bob, opencode): (Vec<_>, Vec<_>) = databases
-                .iter()
-                .cloned()
-                .partition(|file| file.source == SourceKind::Bob);
-            let (zcode, opencode): (Vec<_>, Vec<_>) = opencode
-                .into_iter()
-                .partition(|file| file.source == SourceKind::Zcode);
-            (Some(bob), Some(zcode), Some(opencode))
-        }
-        None => (None, None, None),
-    };
+    let (bob_selected, zcode_selected, kilocode_selected, opencode_selected) =
+        match selected.as_ref() {
+            Some((_, databases)) => {
+                let (bob, databases): (Vec<_>, Vec<_>) = databases
+                    .iter()
+                    .cloned()
+                    .partition(|file| file.source == SourceKind::Bob);
+                let (zcode, databases): (Vec<_>, Vec<_>) = databases
+                    .into_iter()
+                    .partition(|file| file.source == SourceKind::Zcode);
+                let (kilocode, opencode): (Vec<_>, Vec<_>) = databases
+                    .into_iter()
+                    .partition(|file| file.source == SourceKind::Kilocode);
+                (Some(bob), Some(zcode), Some(kilocode), Some(opencode))
+            }
+            None => (None, None, None, None),
+        };
     let discovery::SessionDatabaseDiscovery {
         tasks: mut bob_tasks,
         unchanged_identities: bob_unchanged_identities,
@@ -1634,6 +1772,36 @@ pub(super) fn prepare_refresh(
     files_skipped += zcode.files_skipped;
     total_bytes += zcode.total_bytes;
 
+    let mut kilocode =
+        discover_kilocode(options, &excluder, &mut state, kilocode_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        for path in &pending.source_paths {
+            let database = crate::sources::kilocode::split_virtual_path(Path::new(path))
+                .map(|(database, _)| database)
+                .unwrap_or_else(|| PathBuf::from(path));
+            if kilocode.unreadable_databases.contains(&database) {
+                anyhow::bail!(
+                    "KiloCode source {path} has an interrupted replay but its database cannot be read"
+                );
+            }
+        }
+        for task in &mut kilocode.tasks {
+            let database = crate::sources::kilocode::split_virtual_path(&task.path)
+                .unwrap()
+                .0;
+            if pending.source_paths.iter().any(|path| {
+                *path == task.path.to_string_lossy() || *path == database.to_string_lossy()
+            }) {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(kilocode.tasks);
+    unchanged_identities.extend(kilocode.unchanged_identities);
+    files_scanned += kilocode.files_scanned;
+    files_skipped += kilocode.files_skipped;
+    total_bytes += kilocode.total_bytes;
+
     let Some(opencode) = discovery::discover_opencode(
         paths,
         index,
@@ -1669,6 +1837,7 @@ pub(super) fn prepare_refresh(
     let mut opencode_diagnostics = opencode.diagnostics;
     opencode_diagnostics.merge(bob_diagnostics);
     opencode_diagnostics.merge(zcode.diagnostics);
+    opencode_diagnostics.merge(kilocode.diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -1698,6 +1867,7 @@ pub(super) fn prepare_refresh(
     }
     missing_state_paths.extend(bob_missing_paths);
     missing_state_paths.extend(zcode.missing_paths);
+    missing_state_paths.extend(kilocode.missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

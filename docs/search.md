@@ -24,7 +24,7 @@ Index all supported sources by default. Use repeatable `--only-source <source>` 
 `--exclude-source <source>` options to select providers, and `--claude-path <path>`
 to use a non-default Claude projects directory. Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `jcode`, `muse`,
-`antigravity`, `bob`, and `zcode`. Hermes supports usage tracking only.
+`antigravity`, `bob`, `zcode`, and `kilocode`. Hermes supports usage tracking only.
 Bob tasks are read from `~/.bob/db/bob.db` (override with `MEMEX_BOB_DB`, a comma-separated
 list of database paths with any file name, `~/` expanded); each task is indexed under the
 virtual source path `<db>/<task_id>`, and sub-agent runs embedded in a task appear as their own
@@ -32,6 +32,11 @@ sessions. A database that cannot be read is skipped with a warning and its index
 ZCode sessions are read from `~/.zcode/cli/db/db.sqlite`, the store its SSH-attached
 agent runtimes also write on remote hosts; `ZCODE_HOME` (comma-separated state roots)
 adds extra stores, such as a synced copy from another machine.
+KiloCode CLI sessions are read from `~/.local/share/kilo/kilo.db`
+(`$XDG_DATA_HOME/kilo/kilo.db` when set); `KILO_DATA_DIR` (comma-separated state
+roots) adds extra stores. Subagent sessions are indexed under their own session id
+with the parent recorded, and token usage comes from the per-request counters each
+assistant message carries.
 
 ## Agent memories
 
@@ -237,7 +242,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode` (Hermes has no conversation records)
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode` (Hermes has no conversation records)
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

@@ -16,6 +16,7 @@ pub mod grok;
 pub mod hermes;
 pub mod jcode;
 mod jsonl;
+pub mod kilocode;
 pub mod kiro;
 pub mod muse;
 pub mod omp;
@@ -295,6 +296,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Bob => bob::VERSIONS,
         SourceKind::Zcode => zcode::VERSIONS,
         SourceKind::Kiro => kiro::VERSIONS,
+        SourceKind::Kilocode => kilocode::VERSIONS,
     }
 }
 
@@ -311,6 +313,9 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
         }
         SourceKind::Bob => bob::session_cwd(path).map(|cwd| cwd.to_string_lossy().into_owned()),
         SourceKind::Copilot => copilot::session_cwd(path),
+        SourceKind::Kilocode => {
+            kilocode::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
+        }
         _ => jsonl::scan_session_cwd(path, session_id),
     }
 }
@@ -351,6 +356,7 @@ fn state_store_roots() -> Vec<PathBuf> {
     roots.push(muse::sessions_root());
     roots.extend(antigravity::profile_roots());
     roots.extend(bob::roots());
+    roots.extend(kilocode::roots());
     roots
 }
 
@@ -375,6 +381,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Antigravity
                 | SourceKind::Zcode
                 | SourceKind::Kiro
+                | SourceKind::Kilocode
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -400,6 +407,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Antigravity
     } else if kiro::matches_path(path) {
         SourceKind::Kiro
+    } else if kilocode::matches_path(path) {
+        SourceKind::Kilocode
     } else if grok::matches_path(path) {
         SourceKind::Grok
     } else if cursor::matches_path(path) {
@@ -493,6 +502,7 @@ mod tests {
             SourceKind::Jcode,
             SourceKind::Muse,
             SourceKind::Kiro,
+            SourceKind::Kilocode,
             SourceKind::Grok,
         ] {
             assert_ne!(

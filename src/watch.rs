@@ -172,6 +172,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_zcode {
         roots.extend(crate::sources::zcode::db_dirs());
     }
+    if options.include_kilocode {
+        roots.extend(crate::sources::kilocode::db_dirs());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -220,6 +223,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                 crate::sources::opencode::is_database_path(name)
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
+                    || crate::sources::kilocode::db_paths().contains(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
             })
@@ -415,11 +419,13 @@ pub(crate) fn sweep_candidates(
         file.identity.sqlite_wal.is_none()
             && file.identity.bob_database.is_none()
             && file.identity.zcode_database.is_none()
+            && file.identity.kilocode_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
     databases.extend(reader.bob_database_paths()?);
     databases.extend(reader.zcode_database_paths()?);
+    databases.extend(reader.kilocode_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -731,12 +737,13 @@ impl WatchService {
             let reader = CheckpointReader::open(&paths.state.join("ingest.json"))?;
             sweep_candidates(&reader, cutoff)?
         };
-        // A Bob/ZCode database with no indexed session yet has no state key; seed it
+        // A Bob/ZCode/KiloCode database with no indexed session yet has no state key; seed it
         // from the configuration whenever this daemon watches its directory, so the first
         // commits through a held-open WAL are noticed too.
         for database in crate::sources::bob::database_paths()
             .into_iter()
             .chain(crate::sources::zcode::db_paths())
+            .chain(crate::sources::kilocode::db_paths())
         {
             if database.is_file()
                 && crate::sources::bob::canonical_alias(&database)
@@ -816,6 +823,7 @@ mod tests {
             include_antigravity: true,
             include_bob: true,
             include_zcode: true,
+            include_kilocode: true,
             include_kiro: true,
             exclude_patterns: Vec::new(),
             embeddings: false,
@@ -933,6 +941,7 @@ mod tests {
         options.include_antigravity = false;
         options.include_bob = false;
         options.include_zcode = false;
+        options.include_kilocode = false;
         options.include_kiro = false;
         let roots = watch_roots(&options);
         assert_eq!(roots, options.claude_sources);
@@ -1399,6 +1408,7 @@ mod tests {
                 source_metadata_sha256: None,
                 bob_database: None,
                 zcode_database: None,
+                kilocode_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

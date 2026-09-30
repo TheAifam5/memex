@@ -1553,6 +1553,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
             crate::sources::antigravity::session_cwd(Path::new(&first.source_path))
         }
         SourceKind::Bob => crate::sources::bob::session_cwd(Path::new(&first.source_path)),
+        SourceKind::Kilocode => {
+            crate::sources::kilocode::session_cwd(Path::new(&first.source_path), &first.session_id)
+        }
         SourceKind::Zcode => {
             crate::sources::zcode::session_cwd(Path::new(&first.source_path), &first.session_id)
         }

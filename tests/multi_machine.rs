@@ -75,6 +75,7 @@ fn federated_search_uses_the_configured_ssh_rpc_backend() {
             "--no-jcode",
             "--no-muse",
             "--no-kiro",
+            "--no-kilocode",
             "--no-embeddings",
             "--root",
         ])

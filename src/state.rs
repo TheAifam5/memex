@@ -18,6 +18,9 @@ pub struct FileIdentity {
     /// Owning store of a virtual ZCode session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zcode_database: Option<String>,
+    /// Owning store of a virtual KiloCode session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kilocode_database: Option<String>,
     /// SQLite commits can change only the WAL while the main file stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite_wal: Option<SqliteWalIdentity>,

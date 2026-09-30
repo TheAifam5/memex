@@ -45,6 +45,7 @@ fn concurrent_searches_coalesce_stale_auto_indexing() {
             "--no-jcode",
             "--no-muse",
             "--no-kiro",
+            "--no-kilocode",
             "--no-embeddings",
         ])
         .arg("--root")
