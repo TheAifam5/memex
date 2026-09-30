@@ -42,6 +42,12 @@ memex daemon disable
 The daemon reads config defaults for its mode, interval, listeners, and log paths.
 Flags override those defaults.
 
+If an index has an incompatible schema or term dictionary format, continuous indexing
+logs the recovery error once and stays paused without retrying or exiting into a service
+manager restart loop. The daemon remains running but is not ready. Repair or explicitly
+rebuild the index, then run `memex daemon restart` to resume indexing. An installed
+executable update can still activate while indexing is paused.
+
 ### Resumable embeddings
 
 When embeddings are enabled, continuous indexing runs background backfills in a supervised

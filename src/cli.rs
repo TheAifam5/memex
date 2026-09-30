@@ -2320,25 +2320,44 @@ fn run_index_loop(
             None
         }
     };
-    if mode == WatchMode::Poll {
-        run_poll_loop(
-            index,
-            interval_secs,
-            web_listen,
-            mcp,
-            &mut runtime,
-            &mut upgrade,
-        )
-    } else {
-        run_event_loop(
-            index,
-            Duration::from_secs(interval_secs),
-            web_listen,
-            mcp,
-            &mut runtime,
-            &mut upgrade,
-        )
+    let result = (|| {
+        // Reject incompatible indexes before starting listeners or writable staging.
+        SearchIndex::open_or_create(&paths.index)?;
+        if mode == WatchMode::Poll {
+            run_poll_loop(
+                index,
+                interval_secs,
+                web_listen,
+                mcp,
+                &mut runtime,
+                &mut upgrade,
+            )
+        } else {
+            run_event_loop(
+                index,
+                Duration::from_secs(interval_secs),
+                web_listen,
+                mcp,
+                &mut runtime,
+                &mut upgrade,
+            )
+        }
+    })();
+    if let Err(error) = &result
+        && error.is::<crate::index::IndexCompatibilityError>()
+    {
+        runtime.mark_not_ready()?;
+        eprintln!("daemon: indexing paused: {error:#}");
+        eprintln!("daemon: repair the index, then run `memex daemon restart`");
+        // Existing launchd jobs use KeepAlive=true. Stay idle instead of exiting
+        // into a restart loop; an executable replacement can still recover us.
+        let shutdown = watch_shutdown_flag()?;
+        while wait_for_next_index_cycle(Duration::from_secs(1), &shutdown) {
+            upgrade.check(|| Ok(()));
+        }
+        return Ok(());
     }
+    result
 }
 
 fn run_poll_loop(
@@ -2503,6 +2522,9 @@ fn run_event_loop(
                         service.mark_complete(FireCause::Resync);
                         log_watch_stats(&service);
                     }
+                    Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
+                        return Err(error);
+                    }
                     Err(error) => eprintln!("watch: resync ingest failed, retrying: {error:#}"),
                 }
             }
@@ -2527,18 +2549,25 @@ fn run_event_loop(
                             log_watch_stats(&service);
                         }
                         Err(error) => {
+                            if error.is::<crate::index::IndexCompatibilityError>() {
+                                return Err(error);
+                            }
                             eprintln!("watch: ingest failed, retrying: {error:#}");
                         }
                     },
                     Err(error) => {
                         eprintln!("watch: dirty check failed, ingesting to be safe: {error:#}");
-                        if retry_after_stopping_embedder(&mut worker, || {
+                        match retry_after_stopping_embedder(&mut worker, || {
                             run_index_args(index, false)
-                        })
-                        .is_ok()
-                        {
-                            service.mark_complete(FireCause::Resync);
-                            log_watch_stats(&service);
+                        }) {
+                            Ok(()) => {
+                                service.mark_complete(FireCause::Resync);
+                                log_watch_stats(&service);
+                            }
+                            Err(error) if error.is::<crate::index::IndexCompatibilityError>() => {
+                                return Err(error);
+                            }
+                            Err(error) => eprintln!("watch: ingest failed, retrying: {error:#}"),
                         }
                     }
                 }
@@ -2678,8 +2707,8 @@ fn run_index_selection(
     let index = if reindex {
         SearchIndex::open_or_create_for_rebuild(&paths.index)?
     } else {
-        match SearchIndex::open_or_create(&paths.index) {
-            Ok(index) if !index.is_writable() => index,
+        match SearchIndex::open_or_create(&paths.index)? {
+            index if !index.is_writable() => index,
             _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
         }
     };

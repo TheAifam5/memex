@@ -121,15 +121,36 @@ struct PendingGeneration {
     published: AtomicBool,
     _staging_lease: Arc<GenerationLease>,
     directory: storage::SharedDirectory,
+    _cleanup: StagingCleanup,
 }
 
-impl Drop for PendingGeneration {
+#[derive(Debug)]
+struct StagingCleanup {
+    staging_dir: PathBuf,
+    segment_owner: PathBuf,
+}
+
+impl Drop for StagingCleanup {
     fn drop(&mut self) {
-        if !self.published.load(AtomicOrdering::Acquire) {
-            let _ = fs::remove_dir_all(&self.staging_dir);
+        // After the generation rename, CURRENT may already reference this owner even
+        // if a later publication sync failed. Only an unrenamed staging directory
+        // can be discarded, and inherited owners belong to other generations.
+        if self.staging_dir.exists() && fs::remove_dir_all(&self.staging_dir).is_ok() {
+            let _ = fs::remove_dir_all(&self.segment_owner);
         }
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct IndexCompatibilityError(String);
+
+impl std::fmt::Display for IndexCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IndexCompatibilityError {}
 
 /// Tantivy normally takes a metadata lock every time it opens segment readers so its own
 /// garbage collector cannot remove a segment concurrently. Published generations are immutable,
@@ -642,20 +663,25 @@ impl SearchIndex {
         let source = current
             .as_deref()
             .or_else(|| dir.join("meta.json").is_file().then_some(dir));
+        if source.is_some() {
+            // Validate before adopting legacy hard links into the shared store.
+            let existing = Self::open_or_create(dir)?;
+            if existing.fields.reader_metadata.is_none() {
+                return Err(stale_schema_error(dir));
+            }
+        }
         fs::create_dir(&staging_dir)?;
+        let cleanup = StagingCleanup {
+            staging_dir: staging_dir.clone(),
+            segment_owner: dir.join("segments").join(&generation_name),
+        };
         #[cfg(target_os = "macos")]
         let durability = storage::StagingDurability::prepare(dir, &staging_dir)?;
         #[cfg(not(target_os = "macos"))]
         create_generation_lease_file(&staging_dir)?;
         let staging_lease = Arc::new(acquire_generation_lease(&staging_dir)?);
         let directory =
-            match storage::SharedDirectory::stage(dir, &staging_dir, source, &generation_name) {
-                Ok(directory) => directory,
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&staging_dir);
-                    return Err(error);
-                }
-            };
+            storage::SharedDirectory::stage(dir, &staging_dir, source, &generation_name)?;
         #[cfg(target_os = "macos")]
         directory.set_durability(durability);
         directory.pin_generation(Arc::clone(&staging_lease));
@@ -668,6 +694,7 @@ impl SearchIndex {
             published: AtomicBool::new(false),
             _staging_lease: staging_lease,
             directory: directory.clone(),
+            _cleanup: cleanup,
         });
         let index = if staging_dir.join("meta.json").exists() {
             let existing = Index::open(directory.clone())?;
@@ -707,6 +734,7 @@ impl SearchIndex {
                 return Err(stale_schema_error(dir));
             }
             let fields = load_fields(index.schema())?;
+            check_term_dictionary_format(&index, &fields, dir)?;
             Ok(Self {
                 index,
                 fields,
@@ -2081,10 +2109,10 @@ impl tantivy::collector::CustomSegmentScorer<SessionReverseOrder> for SessionOrd
 }
 
 fn stale_schema_error(dir: &Path) -> anyhow::Error {
-    anyhow!(
+    IndexCompatibilityError(format!(
         "index schema at {} is stale; see docs/vector-migration.md for vector-preserving migration, or explicitly run `memex index rebuild` to discard and rebuild it",
         dir.display()
-    )
+    )).into()
 }
 
 /// Term dictionaries are SSTables; an index written with tantivy's FST dictionaries fails
@@ -2097,10 +2125,10 @@ fn check_term_dictionary_format(index: &Index, fields: &IndexFields, dir: &Path)
     let reader = tantivy::SegmentReader::open(&index.segment(segment))?;
     match reader.inverted_index(fields.text) {
         Ok(_) => Ok(()),
-        Err(error) if error.to_string().contains("dictionary type") => Err(anyhow!(
+        Err(error) if error.to_string().contains("dictionary type") => Err(IndexCompatibilityError(format!(
             "index at {} uses term dictionaries this build cannot read; run `memex index rebuild`",
             dir.display()
-        )),
+        )).into()),
         Err(error) => Err(error.into()),
     }
 }
@@ -4211,6 +4239,208 @@ mod tests {
                 })
                 .expect("search adopted generation")
                 .len(),
+            1
+        );
+    }
+
+    fn create_incompatible_dictionary_index(dir: &Path) -> PathBuf {
+        let mut schema = serde_json::to_value(build_schema().unwrap()).unwrap();
+        let fields = schema.as_array_mut().unwrap();
+        let text = fields.remove(
+            fields
+                .iter()
+                .position(|field| field["name"] == "text")
+                .unwrap(),
+        );
+        // Put text last so its dictionary type is immediately before the composite footer.
+        fields.push(text);
+        let schema: Schema = serde_json::from_value(schema).unwrap();
+        drop(Index::create_in_dir(dir, schema).unwrap());
+        let legacy = SearchIndex::open_or_create(dir).unwrap();
+        let mut writer = legacy.writer().unwrap();
+        legacy
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let segment = legacy
+            .index
+            .segment(legacy.index.searchable_segment_metas().unwrap().remove(0));
+        let component = tantivy::SegmentComponent::Terms;
+        let bytes = segment.open_read(component).unwrap().read_bytes().unwrap();
+        let footer_length =
+            u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()) as usize;
+        let dictionary_type_offset = bytes.len() - 4 - footer_length - 4;
+        assert_eq!(
+            &bytes[dictionary_type_offset..dictionary_type_offset + 4],
+            &2_u32.to_le_bytes()
+        );
+        let path = dir.join(segment.relative_path(component));
+        drop(segment);
+        drop(bytes);
+        drop(legacy);
+        let mut contents = fs::read(&path).unwrap();
+        // FST's type tag is rejected before the dictionary payload is decoded.
+        contents[dictionary_type_offset..dictionary_type_offset + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_open_reports_incompatible_term_dictionaries() {
+        let temp = tempfile::tempdir().unwrap();
+        create_incompatible_dictionary_index(temp.path());
+        let error = SearchIndex::open_or_create(temp.path())
+            .err()
+            .expect("incompatible legacy index must fail");
+        assert!(error.to_string().contains("term dictionaries"));
+    }
+
+    #[test]
+    fn incompatible_ingest_attempts_do_not_accumulate_segment_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let segment = create_incompatible_dictionary_index(temp.path());
+        let original = fs::read(&segment).unwrap();
+        let metadata = fs::read(temp.path().join("meta.json")).unwrap();
+        let mut owner_counts = Vec::new();
+        for _ in 0..3 {
+            let error = SearchIndex::open_or_create_for_ingest(temp.path())
+                .err()
+                .expect("incompatible ingest must fail");
+            assert!(error.to_string().contains("term dictionaries"));
+            let owners = fs::read_dir(temp.path().join("segments"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+                .count();
+            owner_counts.push(owners);
+            assert_eq!(fs::read(&segment).unwrap(), original);
+            assert_eq!(fs::read(temp.path().join("meta.json")).unwrap(), metadata);
+        }
+        assert_eq!(
+            owner_counts,
+            [0, 0, 0],
+            "failed attempts accumulated adopted segment owners"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&segment).unwrap().nlink(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_staging_cleans_partial_legacy_adoption() {
+        let temp = tempfile::tempdir().unwrap();
+        let legacy = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = legacy.writer().unwrap();
+        legacy
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let _store_guard = storage::lock_store(temp.path()).unwrap();
+        let owner = new_generation_name();
+        let staging = temp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(format!(".{owner}.tmp"));
+        fs::create_dir_all(staging.join("meta.json")).unwrap();
+        let cleanup = StagingCleanup {
+            staging_dir: staging.clone(),
+            segment_owner: temp.path().join("segments").join(&owner),
+        };
+        // Adoption succeeds, then metadata copying fails against this directory.
+        assert!(
+            storage::SharedDirectory::stage(temp.path(), &staging, Some(temp.path()), &owner)
+                .is_err()
+        );
+        assert!(cleanup.segment_owner.is_dir());
+        drop(cleanup);
+        assert!(!staging.exists());
+        assert!(!temp.path().join("segments").join(owner).exists());
+        assert_eq!(legacy.doc_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn abandoned_staging_removes_only_its_own_shared_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = first.writer().unwrap();
+        first
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        first.publish_generation().unwrap();
+        let current = fs::read(temp.path().join(CURRENT_FILE)).unwrap();
+        let reader = SearchIndex::open_or_create(temp.path()).unwrap();
+        let update = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = update.writer().unwrap();
+        update
+            .add_record(&mut writer, &test_record(2, "abandoned"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let pending = update.pending_generation.as_ref().unwrap();
+        pending
+            .directory
+            .prepare_publication(
+                temp.path(),
+                &pending.generation_name,
+                &committed_files(&update.index).unwrap(),
+            )
+            .unwrap();
+        let abandoned_owner = pending._cleanup.segment_owner.clone();
+        assert!(abandoned_owner.is_dir());
+        drop(update);
+        assert!(!abandoned_owner.exists());
+        assert_eq!(fs::read(temp.path().join(CURRENT_FILE)).unwrap(), current);
+        assert_eq!(reader.doc_count().unwrap(), 1);
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_publication_after_rename_preserves_current_segment_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "preserved"))
+            .unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let pending = index.pending_generation.as_ref().unwrap();
+        pending
+            .directory
+            .prepare_publication(
+                temp.path(),
+                &pending.generation_name,
+                &committed_files(&index.index).unwrap(),
+            )
+            .unwrap();
+        let owner = pending._cleanup.segment_owner.clone();
+        let published = temp
+            .path()
+            .join(GENERATIONS_DIR)
+            .join(&pending.generation_name);
+        fs::rename(&pending.staging_dir, &published).unwrap();
+        atomic_write_current(temp.path(), &pending.generation_name).unwrap();
+        // Model a sync failure after CURRENT changed but before published was marked.
+        assert!(!pending.published.load(AtomicOrdering::Acquire));
+        drop(index);
+        assert!(owner.is_dir());
+        assert_eq!(
+            SearchIndex::open_or_create(temp.path())
+                .unwrap()
+                .doc_count()
+                .unwrap(),
             1
         );
     }

@@ -144,6 +144,131 @@ fn drain(mut reader: impl Read + Send + 'static, logs: Arc<Mutex<Vec<u8>>>) {
     });
 }
 
+fn create_stale_index(path: &Path) {
+    std::fs::create_dir_all(path).unwrap();
+    let mut schema = tantivy::schema::Schema::builder();
+    schema.add_text_field("text", tantivy::schema::TEXT);
+    drop(tantivy::Index::create_in_dir(path, schema.build()).unwrap());
+}
+
+#[test]
+fn incompatible_one_shot_indexing_does_not_fall_back_to_staging() {
+    let dirs = TestDirs::new();
+    let paths = memex::config::Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+    create_stale_index(&paths.index);
+    let original = std::fs::read(paths.index.join("meta.json")).unwrap();
+    for _ in 0..3 {
+        let mut child = ChildGuard::spawn(
+            &dirs,
+            &[
+                "index",
+                "--root",
+                dirs.root.path().to_str().unwrap(),
+                "--only-source",
+                "claude",
+                "--claude-path",
+                dirs.claude.path().to_str().unwrap(),
+                "--no-embeddings",
+            ],
+        );
+        assert!(!child.wait_for_exit().success());
+        assert_eq!(
+            std::fs::read(paths.index.join("meta.json")).unwrap(),
+            original
+        );
+        assert!(!paths.index.join("segments").exists());
+        assert!(!paths.index.join("generations").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn incompatible_daemon_pauses_once_and_accepts_shutdown() {
+    for mode in ["events", "poll"] {
+        for initialized in [false, true] {
+            let dirs = TestDirs::new();
+            let paths = memex::config::Paths::new(Some(dirs.root.path().to_path_buf())).unwrap();
+            let incompatible = if initialized {
+                paths.index.join("generations/incompatible")
+            } else {
+                paths.index.clone()
+            };
+            if !initialized {
+                create_stale_index(&incompatible);
+            }
+            let mut child = ChildGuard::daemon(&dirs, &["--watch-mode", mode, "--no-mcp"]);
+            if initialized {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while !memex::daemon_runtime::read(&paths)
+                    .unwrap()
+                    .is_some_and(|runtime| runtime.ready)
+                {
+                    child.assert_running();
+                    assert!(
+                        Instant::now() < deadline,
+                        "daemon was not ready: {}",
+                        child.diagnostics()
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                // Simulate a different build publishing an incompatible generation.
+                create_stale_index(&incompatible);
+                std::fs::write(paths.index.join("CURRENT"), "incompatible\n").unwrap();
+            }
+            let metadata = std::fs::read(incompatible.join("meta.json")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !child.diagnostics().contains("daemon: indexing paused:") {
+                child.assert_running();
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not pause: {}",
+                    child.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert!(!memex::daemon_runtime::read(&paths).unwrap().unwrap().ready);
+            let owners = if paths.index.join("segments").exists() {
+                std::fs::read_dir(paths.index.join("segments"))
+                    .unwrap()
+                    .count()
+            } else {
+                0
+            };
+            std::thread::sleep(Duration::from_secs(2));
+            child.assert_running();
+            assert_eq!(
+                child
+                    .diagnostics()
+                    .matches("daemon: indexing paused:")
+                    .count(),
+                1
+            );
+            assert!(child.diagnostics().contains("memex daemon restart"));
+            assert_eq!(
+                std::fs::read(incompatible.join("meta.json")).unwrap(),
+                metadata
+            );
+            if paths.index.join("segments").exists() {
+                assert_eq!(
+                    std::fs::read_dir(paths.index.join("segments"))
+                        .unwrap()
+                        .count(),
+                    owners
+                );
+            }
+            assert!(
+                Command::new("kill")
+                    .args(["-TERM", &child.child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(child.wait_for_exit().success());
+            assert!(memex::daemon_runtime::read(&paths).unwrap().is_none());
+        }
+    }
+}
+
 fn free_address() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve test port");
     listener.local_addr().expect("test socket address")

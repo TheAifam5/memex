@@ -88,6 +88,11 @@ impl DaemonRuntime {
         self.publish()
     }
 
+    pub(crate) fn mark_not_ready(&mut self) -> Result<()> {
+        self.info.ready = false;
+        self.publish()
+    }
+
     fn publish(&self) -> Result<()> {
         let parent = self.state_path.parent().context("runtime state parent")?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
@@ -223,6 +228,8 @@ mod tests {
         assert!(DaemonRuntime::start(&paths).is_err());
         runtime.mark_ready().unwrap();
         assert!(read(&paths).unwrap().unwrap().ready);
+        runtime.mark_not_ready().unwrap();
+        assert!(!read(&paths).unwrap().unwrap().ready);
         drop(runtime);
         assert!(read(&paths).unwrap().is_none());
         let _next = DaemonRuntime::start(&paths).unwrap();
