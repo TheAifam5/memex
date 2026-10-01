@@ -316,6 +316,7 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
         SourceKind::Kilocode => {
             kilocode::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
         }
+        SourceKind::Hermes => hermes::session_cwd(path, session_id),
         _ => jsonl::scan_session_cwd(path, session_id),
     }
 }
@@ -378,6 +379,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Jcode
                 | SourceKind::Muse
                 | SourceKind::Grok
+                | SourceKind::Hermes
                 | SourceKind::Antigravity
                 | SourceKind::Zcode
                 | SourceKind::Kiro

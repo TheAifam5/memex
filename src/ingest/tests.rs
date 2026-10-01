@@ -48,6 +48,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
@@ -2899,6 +2900,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
@@ -3534,6 +3536,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_openclaw: false,
         include_copilot: false,
         include_grok: false,
+        include_hermes: false,
         include_jcode: false,
         include_muse: false,
         include_antigravity: false,
@@ -3762,6 +3765,371 @@ fn ingest_grok_session_from_grok_home_override() {
             .iter()
             .all(|record| record.source_path == session_file.to_string_lossy())
     );
+}
+
+#[test]
+fn ingest_hermes_in_place_edits_replace_text_and_session_metadata() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    connection
+        .execute(
+            "update messages set content = 'expanded user prompt' where id = 101",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "Check the current directory.")
+    );
+
+    connection
+        .execute_batch(
+            "update messages set content = 'revised user prompt' where id = 101;
+         insert into messages(session_id, role, content, timestamp)
+         values ('hermes-session', 'user', 'new tail message', 12);",
+        )
+        .unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        report.records_added > 1,
+        "an edited prefix must be replaced, not appended"
+    );
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised user prompt")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "expanded user prompt")
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.text == "new tail message")
+            .count(),
+        1
+    );
+
+    connection
+        .execute(
+            "update sessions set cwd = '/workspace/renamed-project', parent_session_id = 'parent'",
+            [],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.project == "renamed-project")
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.links.parent_session_id.as_deref() == Some("parent"))
+    );
+}
+
+#[test]
+fn ingest_hermes_sidecar_edits_replace_existing_reply_text() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute_batch(
+            "alter table messages add column codex_message_items text;
+         update messages set content = '' where id = 104;",
+        )
+        .unwrap();
+    let reply = |text: &str| {
+        serde_json::json!([
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": text}]}
+        ])
+        .to_string()
+    };
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("original sidecar reply")],
+        )
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(
+        index
+            .records_by_session_id("hermes-session")
+            .unwrap()
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+
+    connection
+        .execute(
+            "update messages set codex_message_items = ?1 where id = 104",
+            [reply("revised sidecar reply")],
+        )
+        .unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "revised sidecar reply")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "original sidecar reply")
+    );
+}
+
+#[test]
+fn ingest_hermes_deactivation_replaces_previously_indexed_records() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let hermes_root = tmp.path().join("hermes");
+    fs::create_dir_all(&hermes_root).expect("create Hermes root");
+    let database = hermes_root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).expect("open Hermes fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, cwd TEXT, parent_session_id TEXT,
+                 rewind_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                 role TEXT NOT NULL, content TEXT, tool_call_id TEXT,
+                 tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
+                 reasoning TEXT, reasoning_content TEXT,
+                 active INTEGER NOT NULL DEFAULT 1
+             );
+             INSERT INTO sessions(id, cwd) VALUES ('session', '/workspace/hermes');
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'obsolete hermes text', 1);",
+        )
+        .expect("seed Hermes fixture");
+
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(hermes_root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure paths");
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("initial ingest")
+            .records_added,
+        1
+    );
+    connection
+        .execute_batch(
+            "UPDATE messages SET active = 0 WHERE id = 1;
+             INSERT INTO messages(session_id, role, content, timestamp)
+             VALUES ('session', 'user', 'replacement hermes text', 2);",
+        )
+        .expect("deactivate and replace message");
+    assert_eq!(
+        ingest_all(&paths, &index, &options, &lease)
+            .expect("replacement ingest")
+            .records_added,
+        1
+    );
+
+    let records = index
+        .records_by_session_id("session")
+        .expect("Hermes records");
+    assert_eq!(
+        records.len(),
+        1,
+        "inactive record must be removed: {records:?}"
+    );
+    assert_eq!(records[0].text, "replacement hermes text");
+}
+
+fn assert_hermes_reasoning_switch(initial: bool, desired: bool) {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    drop(connection);
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    options.include_reasoning = initial;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    options.include_reasoning = desired;
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.role == "reasoning")
+            .count(),
+        usize::from(desired),
+        "the existing session must reflect the current reasoning option"
+    );
+}
+
+#[test]
+fn ingest_hermes_enabling_reasoning_reindexes_existing_messages() {
+    assert_hermes_reasoning_switch(false, true);
+}
+
+#[test]
+fn ingest_hermes_disabling_reasoning_removes_existing_reasoning() {
+    assert_hermes_reasoning_switch(true, false);
+}
+
+#[test]
+fn ingest_hermes_replaced_database_reindexes_same_message_ids() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    drop(connection);
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    let replacement = root.join("restored.db");
+    let connection = rusqlite::Connection::open(&replacement).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute(
+            "update messages set content = 'restored transcript' where id = 101",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    fs::rename(&replacement, &database).unwrap();
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+    let records = index.records_by_session_id("hermes-session").unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.text == "restored transcript")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.text == "Check the current directory.")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn ingest_hermes_wal_appends_remain_incremental_after_checkpoint() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hermes");
+    fs::create_dir_all(&root).unwrap();
+    let database = root.join("state.db");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(include_str!("../../fixtures/trajectory_parity/hermes.sql"))
+        .unwrap();
+    connection
+        .execute_batch("pragma wal_autocheckpoint = 0")
+        .unwrap();
+    let _env = EnvVarGuard::set_os(&[("HERMES_PROFILE_ROOTS", Some(root.as_os_str()))]);
+    let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = open_search_index(&paths);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_hermes = true;
+    let lease = ingest_lease(&paths);
+    ingest_all(&paths, &index, &options, &lease).unwrap();
+
+    for timestamp in [11, 12] {
+        connection
+            .execute(
+                "insert into messages(session_id, role, content, timestamp)
+                 values ('hermes-session', 'user', 'new message', ?1)",
+                rusqlite::params![timestamp],
+            )
+            .unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            1
+        );
+        connection
+            .execute_batch("pragma wal_checkpoint(truncate)")
+            .unwrap();
+        assert_eq!(
+            ingest_all(&paths, &index, &options, &lease)
+                .unwrap()
+                .records_added,
+            0
+        );
+    }
 }
 
 #[test]

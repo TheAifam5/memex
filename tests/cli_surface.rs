@@ -305,7 +305,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             let sources = report["sources"].as_array().unwrap();
             assert!(sources.iter().any(|source| source == "kiro"));
             assert!(sources.iter().any(|source| source == "zcode"));
-            assert!(!sources.iter().any(|source| source == "hermes"));
+            assert!(sources.iter().any(|source| source == "hermes"));
         }
         let mut args = command;
         args.extend(["--root", root, "--no-update-check"]);
@@ -323,6 +323,7 @@ fn stats_text_and_json_preserve_configuration_memory_and_backfill_details() {
             "  model: minilm",
             "  execution-provider: cpu",
             "  - kiro",
+            "  - hermes",
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
@@ -376,12 +377,13 @@ fn index_source_help_uses_positive_repeatable_filters() {
         let help = successful_stdout(&args);
         assert_help_has_options(
             &help,
-            &["--claude-path", "--only-source", "--exclude-source"],
+            &[
+                "--claude-path",
+                "--only-source",
+                "--exclude-source",
+                "hermes",
+            ],
             &["--source"],
-        );
-        assert!(
-            !help.contains("hermes"),
-            "unsupported ingest source shown in {args:?}"
         );
     }
 }
