@@ -18,7 +18,13 @@ case "$SIGNING_MODE" in
   *) echo "Unknown SIGNING_MODE: $SIGNING_MODE" >&2; exit 1 ;;
 esac
 read -r -a ARCH_LIST <<< "${ARCHES:-$(uname -m)}"
-SWIFT_ARGS=()
+SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+# Swift 6.4's Clang linker invocation can record the deployment target as the
+# SDK version. Pass Clang's Darwin SDK option explicitly so AppKit uses the
+# current SDK's toolbar/sidebar layout instead of legacy compatibility drawing.
+SWIFT_ARGS=(--sdk "$SDK_PATH"
+  -Xswiftc -Xclang-linker -Xswiftc -isysroot
+  -Xswiftc -Xclang-linker -Xswiftc "$SDK_PATH")
 for arch in "${ARCH_LIST[@]}"; do
   case "$arch" in arm64|x86_64) ;; *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; esac
   SWIFT_ARGS+=(--arch "$arch")

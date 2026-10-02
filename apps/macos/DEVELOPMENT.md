@@ -43,6 +43,11 @@ Run the native tests with:
 swift test --package-path apps/macos
 ```
 
+Check the packaged app's SDK metadata with `bash apps/macos/Tests/build-sdk.sh`.
+This builds a debug bundle and verifies that it records the selected SDK while
+retaining macOS 14 support. Incorrect SDK metadata enables legacy AppKit drawing
+and can misalign the toolbar and sidebar on newer macOS versions.
+
 To also test the Swift client against a real Rust daemon, build the CLI and run:
 
 ```sh

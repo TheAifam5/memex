@@ -296,9 +296,12 @@ struct HomeActivityView: View {
             }
             .chartXScale(domain: payload.bucketKeys)
             .chartXAxis {
-                AxisMarks(values: axisKeys(payload.bucketKeys)) { value in
-                    AxisValueLabel(anchor: value.index == 0 ? .topLeading : value.index == value.count - 1 ? .topTrailing : .top) {
-                        if let key = value.as(String.self) {
+                let labelKeys = axisKeys(payload.bucketKeys)
+                AxisMarks(values: labelKeys) { value in
+                    // Newer Charts can visit every categorical value, including
+                    // values outside the requested marks. Keep labels sparse.
+                    if let key = value.as(String.self), labelKeys.contains(key) {
+                        AxisValueLabel(anchor: key == labelKeys.first ? .topLeading : key == labelKeys.last ? .topTrailing : .top) {
                             Text(axisLabel(key)).fixedSize()
                         }
                     }
