@@ -802,7 +802,6 @@ mod tests {
     use crate::config::UserConfig;
     use crate::state::{FileIdentity, FileState, IngestState};
     use crate::test_support::{EnvVarGuard, env_lock};
-    use crossbeam_channel::unbounded;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::path::Path;
@@ -1307,7 +1306,7 @@ mod tests {
         let probe = root.join("ready.txt");
         std::fs::write(&target, "x").expect("seed");
         std::fs::write(&probe, "").expect("probe");
-        let (tx, rx) = unbounded::<notify::Result<Event>>();
+        let (tx, rx) = crossbeam_channel::unbounded::<notify::Result<Event>>();
         let mut watcher = RecommendedWatcher::new(
             move |result| {
                 let _ = tx.send(result);

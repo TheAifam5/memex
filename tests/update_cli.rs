@@ -265,7 +265,8 @@ fn run_pty_with_tui_input(command: &mut Command, input: &[u8], tui_input: &[u8])
             &mut slave_fd,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // BSD platforms declare this input pointer as mutable.
+            &raw mut size,
         )
     };
     assert_eq!(
