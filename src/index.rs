@@ -236,6 +236,60 @@ pub struct SessionScopeKey {
 
 type SessionScopeIdentity = (crate::types::SourceKind, String, String);
 
+struct DocIdCollector;
+
+struct DocIdSegmentCollector {
+    doc_ids: Arc<dyn tantivy::columnar::ColumnValues<u64>>,
+    matches: Vec<u64>,
+}
+
+impl Collector for DocIdCollector {
+    type Fruit = HashSet<u64>;
+    type Child = DocIdSegmentCollector;
+
+    fn for_segment(
+        &self,
+        _segment_local_id: u32,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(DocIdSegmentCollector {
+            doc_ids: segment
+                .fast_fields()
+                .u64("doc_id")?
+                // Preserve the missing-value behavior of the former ascending TopDocs collector.
+                .first_or_default_col(u64::MAX),
+            matches: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, segment_fruits: Vec<Vec<u64>>) -> tantivy::Result<Self::Fruit> {
+        // Buffer only IDs so the final set can be sized once, without a count query
+        // or growing and then rehashing a separate set for every segment.
+        let count = segment_fruits.iter().map(Vec::len).sum();
+        let mut matches = HashSet::with_capacity(count);
+        for segment in segment_fruits {
+            matches.extend(segment);
+        }
+        Ok(matches)
+    }
+}
+
+impl SegmentCollector for DocIdSegmentCollector {
+    type Fruit = Vec<u64>;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        self.matches.push(self.doc_ids.get_val(doc));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.matches
+    }
+}
+
 struct SessionScopeCollector {
     fields: IndexFields,
     fast_session_identity: bool,
@@ -1327,17 +1381,10 @@ impl SearchIndex {
         let mut filter_options = options.clone();
         filter_options.query.clear();
         let query = build_query(&self.fields, &filter_options, &self.index)?;
-        let count = searcher.search(query.as_ref(), &Count)?;
-        if count == 0 {
-            return Ok(HashSet::new());
-        }
 
         // This query-scoped set trades memory proportional to the filtered lexical matches for
         // native filtered traversal without requesting or re-querying the entire vector corpus.
-        let collector = TopDocs::with_limit(count).order_by_fast_field::<u64>("doc_id", Order::Asc);
-        let doc_ids: Vec<(u64, tantivy::DocAddress)> =
-            searcher.search(query.as_ref(), &collector)?;
-        Ok(doc_ids.into_iter().map(|(doc_id, _)| doc_id).collect())
+        Ok(searcher.search(query.as_ref(), &DocIdCollector)?)
     }
 
     pub fn records_by_session_id(&self, session_id: &str) -> Result<Vec<Record>> {
@@ -3504,6 +3551,86 @@ mod tests {
             })
             .expect("empty scope");
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn filter_doc_ids_collect_all_live_matches_across_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let mut writer = index.index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let high_id = u64::from(u32::MAX) + 1;
+        for ids in [[0, 7, 8], [7, high_id, u64::MAX]] {
+            for id in ids {
+                index
+                    .add_record(&mut writer, &test_record(id, "indexed text"))
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+        }
+        let mut other = test_record(99, "indexed text");
+        other.project = "other".to_string();
+        index.add_record(&mut writer, &other).unwrap();
+        writer.delete_term(Term::from_field_u64(index.fields.doc_id, 8));
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        assert_eq!(index.segment_count().unwrap(), 3);
+
+        let options = QueryOptions {
+            // Semantic prefilters must ignore lexical text and the result limit.
+            query: "no lexical matches".to_string(),
+            project: Some("memex".to_string()),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        assert_eq!(
+            index.doc_ids_matching_filters(&options).unwrap(),
+            HashSet::from([0, 7, high_id, u64::MAX])
+        );
+        assert!(
+            index
+                .doc_ids_matching_filters(&QueryOptions {
+                    project: Some("missing".to_string()),
+                    ..options.clone()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .doc_ids_matching_filters(&QueryOptions {
+                    session_scope: Some(Vec::new()),
+                    ..options
+                })
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn filter_doc_ids_preserve_missing_fast_field_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(tmp.path()).unwrap();
+        let mut writer = index.index.writer_with_num_threads(1, 15_000_000).unwrap();
+        index
+            .add_record(&mut writer, &test_record(1, "indexed text"))
+            .unwrap();
+        let mut missing_id = TantivyDocument::default();
+        missing_id.add_text(index.fields.project, "memex");
+        writer.add_document(missing_id).unwrap();
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        assert_eq!(
+            searcher.search(&AllQuery, &DocIdCollector).unwrap(),
+            HashSet::from([1, u64::MAX])
+        );
     }
 
     #[test]
