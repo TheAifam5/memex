@@ -75,8 +75,9 @@ pub struct SearchSpec {
     /// starts at the first query term when that lies beyond the cap.
     #[serde(default)]
     pub text_limit: Option<usize>,
-    /// Per-search reranking override: `Some(false)` disables it and `Some(true)` loads the
-    /// model even in a one-shot process. Each machine reranks with its own configuration.
+    /// Per-search reranking override: `Some(false)` disables it and `Some(true)` loads a
+    /// local model even in a one-shot process; remote reranking runs without it. Each
+    /// machine reranks with its own configuration.
     #[serde(default)]
     pub rerank: Option<bool>,
 }
@@ -2704,7 +2705,7 @@ fn search_local(
     );
     let mut score = |query: &str, documents: &[String]| match &settings {
         Some(settings) => {
-            crate::rerank::rerank_local(settings, spec.rerank == Some(true), query, documents)
+            crate::rerank::score(settings, spec.rerank == Some(true), query, documents)
         }
         None => Err(anyhow!("reranking is not configured")),
     };
@@ -2728,8 +2729,7 @@ fn local_rerank_settings(
     notify_one_shot: &mut dyn FnMut(),
 ) -> Option<crate::rerank::RerankSettings> {
     use crate::rerank::RerankDecision;
-    let configured = config.rerank_mode() == crate::config::RerankMode::Local;
-    match crate::rerank::decide(configured, spec.rerank, background, &spec.query) {
+    match crate::rerank::decide(config.rerank_mode(), spec.rerank, background, &spec.query) {
         RerankDecision::Skip => None,
         RerankDecision::SkipOneShot => {
             notify_one_shot();
@@ -4656,6 +4656,57 @@ mod tests {
         )
         .expect("search without reranking");
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn remote_reranking_runs_in_one_shot_processes_without_a_notice() {
+        let _guard = crate::test_support::env_lock();
+        let _env = crate::test_support::EnvVarGuard::set(&[
+            ("MEMEX_RERANK_MODEL", None),
+            ("MEMEX_RERANK_API_KEY", None),
+        ]);
+        let remote: UserConfig = toml::from_str(
+            "rerank = \"remote\"\nrerank_url = \"http://127.0.0.1:9/rerank\"\n\
+             rerank_model = \"rerank-test\"",
+        )
+        .unwrap();
+        let missing_url: UserConfig =
+            toml::from_str("rerank = \"remote\"\nrerank_model = \"rerank-test\"").unwrap();
+        let spec = needle_spec(SearchMode::Lexical, 3);
+        let mut warnings = Vec::new();
+        let mut notices = 0;
+        let mut decide =
+            |config: &UserConfig, query: &str, requested: Option<bool>, background: bool| {
+                local_rerank_settings(
+                    config,
+                    &SearchSpec {
+                        query: query.to_string(),
+                        rerank: requested,
+                        ..spec.clone()
+                    },
+                    background,
+                    &mut |error| warnings.push(error.to_string()),
+                    &mut || notices += 1,
+                )
+            };
+        for (requested, background) in [(None, false), (None, true), (Some(true), false)] {
+            let settings = decide(&remote, "needle", requested, background)
+                .expect("remote reranking runs in every process");
+            assert!(matches!(
+                settings.engine,
+                crate::rerank::RerankEngine::Remote(_)
+            ));
+        }
+        assert_eq!(decide(&remote, "needle", Some(false), false), None);
+        assert_eq!(decide(&remote, " ", None, false), None);
+        assert_eq!(decide(&missing_url, "needle", None, false), None);
+        assert_eq!(notices, 0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("requires rerank_url"),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]

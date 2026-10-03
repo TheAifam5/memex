@@ -18,6 +18,8 @@ pub mod profiling;
 pub mod progress;
 pub mod read_budget;
 pub mod remote_embed;
+pub mod remote_http;
+pub mod remote_rerank;
 mod repository;
 pub mod rerank;
 pub mod resume;

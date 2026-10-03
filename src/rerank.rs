@@ -4,8 +4,13 @@
 //! life of the process. The load takes several seconds, so searches run it only when
 //! the process opted in with [`enable_background_loading`], which also moves the load
 //! to a background thread, or the caller asked for it explicitly.
+//!
+//! Remote reranking loads nothing and runs in every search; after a failed request,
+//! searches skip it for [`REMOTE_FAILURE_BACKOFF`].
 
+use crate::config::RerankMode;
 use crate::embed::{EmbedRuntimeConfig, execution_providers, provider_init_error};
+use crate::remote_rerank::{RemoteRerankConfig, RemoteReranker, RerankDialect, RerankExtraBody};
 use crate::types::Record;
 use anyhow::{Result, anyhow};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
@@ -33,16 +38,25 @@ const MAX_FAILURE_WARNINGS: usize = 64;
 const ONE_SHOT_NOTICE: &str =
     "reranking is configured but skipped in one-shot searches; pass --rerank to load the model";
 
-/// Resolved local reranking settings.
+/// Resolved reranking settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RerankSettings {
-    pub model: RerankerModel,
+    pub engine: RerankEngine,
     /// Leading results rescored per search.
     pub candidates: usize,
     /// Characters of each result sent to the model.
     pub doc_chars: usize,
-    /// ONNX Runtime settings, resolved like those of local embeddings.
-    pub runtime: EmbedRuntimeConfig,
+}
+
+/// What scores the documents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RerankEngine {
+    Local {
+        model: RerankerModel,
+        /// ONNX Runtime settings, resolved like those of local embeddings.
+        runtime: EmbedRuntimeConfig,
+    },
+    Remote(RemoteRerankConfig),
 }
 
 /// Scores documents against a query.
@@ -229,11 +243,23 @@ fn report_event(event: SlotEvent) {
             if explicit {
                 let _ = writeln!(out, "{}", failure_warning(&message));
             } else {
-                warn_failure_once(&WARNED_FAILURES, &message, Instant::now(), out);
+                warn_failure_once(
+                    &WARNED_FAILURES,
+                    &message,
+                    Instant::now(),
+                    LOAD_RETRY_DELAY,
+                    out,
+                );
             }
         }
         SlotEvent::LoadFailed(message) => {
-            warn_failure_once(&WARNED_FAILURES, &message, Instant::now(), out);
+            warn_failure_once(
+                &WARNED_FAILURES,
+                &message,
+                Instant::now(),
+                LOAD_RETRY_DELAY,
+                out,
+            );
         }
     }
 }
@@ -648,24 +674,220 @@ static LOCAL_MODEL: LazyLock<Arc<ModelSlot<LocalReranker>>> = LazyLock::new(|| {
     ))
 });
 
-/// Score `documents` with the process-wide local model for `settings`.
+/// Score `documents` with the reranker of `settings`, one score per document in input
+/// order, or `None` when this search skips reranking.
 ///
-/// Returns `None` when this search skips reranking: the model is loading, busy for
-/// longer than two seconds, or failed to load within the last five minutes. An
+/// Local reranking uses the process-wide model and skips while the model is loading,
+/// busy for longer than two seconds, or failed to load within the last five minutes. An
 /// `explicit` request, or any request in a process that did not enable
 /// [`enable_background_loading`], waits up to 30 minutes for its own load or a minute
 /// for another search's load. Other requests load the model on a background thread.
 /// Loads and inference run on worker threads, so a failure or panic in the model code
 /// is an error for this search only.
-pub fn rerank_local(
+///
+/// Remote reranking sends one request and never fails: a failed request is reported on
+/// stderr and returns `None`, and searches within [`REMOTE_FAILURE_BACKOFF`] of it skip
+/// without a request.
+pub fn score(
     settings: &RerankSettings,
     explicit: bool,
     query: &str,
     documents: &[String],
 ) -> Result<Option<Vec<f32>>> {
-    let mode = load_mode(explicit, background_loading_enabled());
-    LOCAL_MODEL.score(&settings.model, &settings.runtime, mode, query, documents)
+    match &settings.engine {
+        RerankEngine::Local { model, runtime } => {
+            let mode = load_mode(explicit, background_loading_enabled());
+            LOCAL_MODEL.score(model, runtime, mode, query, documents)
+        }
+        RerankEngine::Remote(config) => Ok(REMOTE_BREAKER.score(config, explicit, || {
+            RemoteReranker::new(config)?.rerank(query, documents)
+        })),
+    }
 }
+
+/// Wait after a failed remote rerank request before a search sends another.
+pub const REMOTE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+const REMOTE_SKIPPED_WARNING: &str =
+    "warning: rerank server failed within the last minute; search not reranked";
+
+/// A remote reranking outcome for the user to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteEvent {
+    /// A search skipped reranking within [`REMOTE_FAILURE_BACKOFF`] of a failure.
+    Skipped { explicit: bool },
+    /// A request failed.
+    Failed { message: String, explicit: bool },
+}
+
+/// Show `event` on stderr: explicit requests warn every time; other searches warn once
+/// per distinct failure and [`REMOTE_FAILURE_BACKOFF`], and skip quietly.
+fn report_remote_event(event: RemoteEvent) {
+    let out = &mut std::io::stderr().lock();
+    match event {
+        RemoteEvent::Skipped { explicit: true } => {
+            let _ = writeln!(out, "{REMOTE_SKIPPED_WARNING}");
+        }
+        RemoteEvent::Skipped { explicit: false } => {}
+        RemoteEvent::Failed {
+            message,
+            explicit: true,
+        } => {
+            let _ = writeln!(out, "{}", failure_warning(&message));
+        }
+        RemoteEvent::Failed {
+            message,
+            explicit: false,
+        } => {
+            warn_failure_once(
+                &WARNED_REMOTE_FAILURES,
+                &message,
+                Instant::now(),
+                REMOTE_FAILURE_BACKOFF,
+                out,
+            );
+        }
+    }
+}
+
+/// Identity of the remote requests a failure holds back; never holds the API key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteKey {
+    url: String,
+    model: Option<String>,
+    dialect: RerankDialect,
+    extra_body: Option<RerankExtraBody>,
+}
+
+impl RemoteKey {
+    fn of(config: &RemoteRerankConfig) -> Self {
+        Self {
+            url: config.endpoint.base_url.clone(),
+            model: config.model.clone(),
+            dialect: config.dialect,
+            extra_body: config.extra_body.clone(),
+        }
+    }
+}
+
+/// Requests held back after a failure.
+#[derive(Debug)]
+struct Blocked {
+    key: RemoteKey,
+    /// When the next request may start.
+    retry_at: Instant,
+    /// A search claimed the next request and has not finished it.
+    probing: bool,
+}
+
+/// Holds back remote reranking for [`REMOTE_FAILURE_BACKOFF`] after a failed request,
+/// so an unreachable server does not add its timeout to every search.
+pub(crate) struct RemoteBreaker {
+    blocked: Mutex<Option<Blocked>>,
+    clock: Box<dyn Clock>,
+    report: Box<dyn Fn(RemoteEvent) + Send + Sync>,
+}
+
+/// Marks a claimed request that ended without a result, such as by a panic, as failed,
+/// so later searches are not held back forever.
+struct ProbeGuard<'a> {
+    breaker: &'a RemoteBreaker,
+    key: &'a RemoteKey,
+    armed: bool,
+}
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.breaker.fail(self.key);
+        }
+    }
+}
+
+impl RemoteBreaker {
+    pub(crate) fn new(
+        clock: Box<dyn Clock>,
+        report: Box<dyn Fn(RemoteEvent) + Send + Sync>,
+    ) -> Self {
+        Self {
+            blocked: Mutex::new(None),
+            clock,
+            report,
+        }
+    }
+
+    /// Scores from `request`, or `None` when the request fails or a request for the
+    /// same URL, model, dialect, and extra body failed within [`REMOTE_FAILURE_BACKOFF`].
+    ///
+    /// After a failure, the first search past the backoff sends the only request until
+    /// that request finishes, however long it takes; concurrent searches skip meanwhile.
+    /// Other settings, such as a reloaded configuration, are not held back.
+    pub(crate) fn score(
+        &self,
+        config: &RemoteRerankConfig,
+        explicit: bool,
+        request: impl FnOnce() -> Result<Vec<f32>>,
+    ) -> Option<Vec<f32>> {
+        let key = RemoteKey::of(config);
+        let probe = {
+            let mut blocked = self.lock_blocked();
+            match &mut *blocked {
+                Some(state) if state.key == key => {
+                    if state.probing || self.clock.now() < state.retry_at {
+                        drop(blocked);
+                        (self.report)(RemoteEvent::Skipped { explicit });
+                        return None;
+                    }
+                    state.probing = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        let mut guard = ProbeGuard {
+            breaker: self,
+            key: &key,
+            armed: probe,
+        };
+        let result = request();
+        guard.armed = false;
+        match result {
+            Ok(scores) => {
+                let mut blocked = self.lock_blocked();
+                if blocked.as_ref().is_some_and(|state| state.key == key) {
+                    *blocked = None;
+                }
+                Some(scores)
+            }
+            Err(error) => {
+                self.fail(&key);
+                (self.report)(RemoteEvent::Failed {
+                    message: format!("{error:#}"),
+                    explicit,
+                });
+                None
+            }
+        }
+    }
+
+    /// Hold back requests for `key` for [`REMOTE_FAILURE_BACKOFF`] from now.
+    fn fail(&self, key: &RemoteKey) {
+        *self.lock_blocked() = Some(Blocked {
+            key: key.clone(),
+            retry_at: self.clock.now() + REMOTE_FAILURE_BACKOFF,
+            probing: false,
+        });
+    }
+
+    fn lock_blocked(&self) -> MutexGuard<'_, Option<Blocked>> {
+        self.blocked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The failure backoff shared by every remote search in this process.
+static REMOTE_BREAKER: LazyLock<RemoteBreaker> =
+    LazyLock::new(|| RemoteBreaker::new(Box::new(SystemClock), Box::new(report_remote_event)));
 
 /// Explicit requests, and any request in a process without background loading, block.
 fn load_mode(explicit: bool, background: bool) -> LoadMode {
@@ -700,17 +922,18 @@ pub enum RerankDecision {
 /// Decide whether a search reranks.
 ///
 /// `requested` is the per-search override: `Some(false)` disables reranking and
-/// `Some(true)` loads the model even in a one-shot process. Nothing reranks unless
-/// `configured`, and a blank query never reranks.
+/// `Some(true)` loads a local model even in a one-shot process. Remote reranking loads
+/// nothing, so it runs in every process. Nothing reranks while `mode` is off, and a blank
+/// query never reranks.
 pub fn decide(
-    configured: bool,
+    mode: RerankMode,
     requested: Option<bool>,
     background: bool,
     query: &str,
 ) -> RerankDecision {
-    if !configured || requested == Some(false) || query.trim().is_empty() {
+    if mode == RerankMode::Off || requested == Some(false) || query.trim().is_empty() {
         RerankDecision::Skip
-    } else if requested == Some(true) || background {
+    } else if mode == RerankMode::Remote || requested == Some(true) || background {
         RerankDecision::Run
     } else {
         RerankDecision::SkipOneShot
@@ -1014,6 +1237,9 @@ static LOADING_NOTICE_PRINTED: AtomicBool = AtomicBool::new(false);
 static BUSY_WARNING_PRINTED: AtomicBool = AtomicBool::new(false);
 /// When each distinct failure was last shown.
 static WARNED_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+/// When each distinct remote request failure was last shown.
+static WARNED_REMOTE_FAILURES: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(Default::default);
 
 /// Tell the user, once per process, that a one-shot search skipped reranking.
 pub fn notify_one_shot_skip() {
@@ -1031,6 +1257,7 @@ pub fn warn_failure(error: &anyhow::Error) {
         &WARNED_FAILURES,
         &format!("{error:#}"),
         Instant::now(),
+        LOAD_RETRY_DELAY,
         &mut std::io::stderr().lock(),
     );
 }
@@ -1047,16 +1274,19 @@ fn notify_once(printed: &AtomicBool, message: &str, out: &mut impl Write) -> boo
     true
 }
 
+/// Show `message` unless it was shown within `window`; at most [`MAX_FAILURE_WARNINGS`]
+/// distinct messages are tracked per window.
 fn warn_failure_once(
     warned: &Mutex<HashMap<String, Instant>>,
     message: &str,
     now: Instant,
+    window: Duration,
     out: &mut impl Write,
 ) -> bool {
     let mut warned = warned
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let due = |last: &Instant| now.saturating_duration_since(*last) >= LOAD_RETRY_DELAY;
+    let due = |last: &Instant| now.saturating_duration_since(*last) >= window;
     if warned.get(message).is_some_and(|last| !due(last)) {
         return false;
     }
@@ -1124,21 +1354,283 @@ mod tests {
     #[test]
     fn decision_requires_configuration_a_query_and_an_opt_in() {
         use RerankDecision::{Run, Skip, SkipOneShot};
-        for (configured, requested, background, query, expected) in [
-            (false, Some(true), true, "q", Skip),
-            (true, Some(false), true, "q", Skip),
-            (true, Some(true), true, " \t\n", Skip),
-            (true, None, true, "", Skip),
-            (true, None, true, "q", Run),
-            (true, Some(true), false, "q", Run),
-            (true, None, false, "q", SkipOneShot),
+        use RerankMode::{Local, Off, Remote};
+        for (mode, requested, background, query, expected) in [
+            (Off, Some(true), true, "q", Skip),
+            (Local, Some(false), true, "q", Skip),
+            (Local, Some(true), true, " \t\n", Skip),
+            (Local, None, true, "", Skip),
+            (Local, None, true, "q", Run),
+            (Local, Some(true), false, "q", Run),
+            (Local, None, false, "q", SkipOneShot),
+            // Remote reranking loads nothing, so one-shot processes run it too.
+            (Remote, None, false, "q", Run),
+            (Remote, None, true, "q", Run),
+            (Remote, Some(true), false, "q", Run),
+            (Remote, Some(false), false, "q", Skip),
+            (Remote, Some(false), true, "q", Skip),
+            (Remote, None, false, " ", Skip),
+            (Remote, Some(true), false, "", Skip),
         ] {
             assert_eq!(
-                decide(configured, requested, background, query),
+                decide(mode, requested, background, query),
                 expected,
-                "{configured} {requested:?} {background} {query:?}"
+                "{mode:?} {requested:?} {background} {query:?}"
             );
         }
+    }
+
+    fn remote_config(url: &str) -> RemoteRerankConfig {
+        RemoteRerankConfig {
+            endpoint: crate::test_support::remote_server::endpoint(url, None, 0),
+            model: Some("rerank-test".to_string()),
+            dialect: Default::default(),
+            extra_body: None,
+        }
+    }
+
+    struct TestBreaker {
+        breaker: RemoteBreaker,
+        now: Arc<Mutex<Instant>>,
+        events: Arc<Mutex<Vec<RemoteEvent>>>,
+    }
+
+    impl TestBreaker {
+        fn new() -> Self {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let reported = Arc::clone(&events);
+            let breaker = RemoteBreaker::new(
+                Box::new(FakeClock {
+                    now: Arc::clone(&now),
+                    real_sleep: false,
+                    hook: Arc::new(Mutex::new(None)),
+                }),
+                Box::new(move |event| reported.lock().expect("events").push(event)),
+            );
+            Self {
+                breaker,
+                now,
+                events,
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.now.lock().expect("clock") += duration;
+        }
+
+        fn events(&self) -> Vec<RemoteEvent> {
+            std::mem::take(&mut *self.events.lock().expect("events"))
+        }
+    }
+
+    #[test]
+    fn remote_failure_holds_back_requests_for_the_backoff() {
+        let breaker = TestBreaker::new();
+        let config = remote_config("https://rerank.example.test/v1/rerank");
+        let requests = std::cell::Cell::new(0);
+        let failing = || {
+            requests.set(requests.get() + 1);
+            Err(anyhow!("rerank server returned HTTP 503: down"))
+        };
+        assert_eq!(breaker.breaker.score(&config, false, failing), None);
+        assert_eq!(
+            breaker.events(),
+            vec![RemoteEvent::Failed {
+                message: "rerank server returned HTTP 503: down".to_string(),
+                explicit: false
+            }]
+        );
+        // Within the window no request is sent; explicit requests warn every time.
+        for explicit in [false, true, true, false] {
+            assert_eq!(breaker.breaker.score(&config, explicit, failing), None);
+            breaker.advance(Duration::from_secs(10));
+        }
+        assert_eq!(requests.get(), 1);
+        assert_eq!(
+            breaker.events(),
+            vec![
+                RemoteEvent::Skipped { explicit: false },
+                RemoteEvent::Skipped { explicit: true },
+                RemoteEvent::Skipped { explicit: true },
+                RemoteEvent::Skipped { explicit: false },
+            ]
+        );
+        // Other settings, such as a reloaded configuration, are not held back.
+        let other = remote_config("https://other.example.test/rerank");
+        assert_eq!(
+            breaker.breaker.score(&other, false, || Ok(vec![0.5])),
+            Some(vec![0.5])
+        );
+        let other_body = RemoteRerankConfig {
+            extra_body: RerankExtraBody::parse(r#"{"provider": {"zdr": false}}"#).expect("parse"),
+            ..config.clone()
+        };
+        assert_eq!(
+            breaker.breaker.score(&other_body, false, || Ok(vec![0.5])),
+            Some(vec![0.5])
+        );
+
+        breaker.advance(REMOTE_FAILURE_BACKOFF - Duration::from_secs(40));
+        assert_eq!(
+            breaker.breaker.score(&config, true, || Ok(vec![0.25])),
+            Some(vec![0.25])
+        );
+        assert_eq!(breaker.events(), Vec::new());
+        // Success clears the backoff.
+        assert_eq!(breaker.breaker.score(&config, false, failing), None);
+        assert_eq!(requests.get(), 2);
+        breaker.advance(REMOTE_FAILURE_BACKOFF);
+        assert_eq!(
+            breaker.breaker.score(&config, false, || Ok(vec![0.75])),
+            Some(vec![0.75])
+        );
+        assert_eq!(
+            breaker.breaker.score(&config, false, || Ok(vec![0.75])),
+            Some(vec![0.75])
+        );
+    }
+
+    #[test]
+    fn remote_probe_after_the_backoff_is_the_only_request_until_it_finishes() {
+        let breaker = TestBreaker::new();
+        let config = remote_config("https://rerank.example.test/rerank");
+        assert_eq!(
+            breaker
+                .breaker
+                .score(&config, false, || Err(anyhow!("timeout"))),
+            None
+        );
+        breaker.advance(REMOTE_FAILURE_BACKOFF);
+        let concurrent = breaker.breaker.score(&config, true, || {
+            // A search that starts while this probe runs skips without a request, even
+            // after the probe has run past another backoff period.
+            breaker.advance(REMOTE_FAILURE_BACKOFF * 2);
+            assert_eq!(
+                breaker
+                    .breaker
+                    .score(&config, false, || panic!("second request")),
+                None
+            );
+            Err(anyhow!("timeout"))
+        });
+        assert_eq!(concurrent, None);
+        // The probe's failure starts a new backoff from when it finished.
+        breaker.advance(REMOTE_FAILURE_BACKOFF - Duration::from_secs(1));
+        assert_eq!(
+            breaker
+                .breaker
+                .score(&config, false, || panic!("held back")),
+            None
+        );
+        breaker.advance(Duration::from_secs(1));
+        assert_eq!(
+            breaker.breaker.score(&config, false, || Ok(vec![0.5])),
+            Some(vec![0.5])
+        );
+        assert_eq!(
+            breaker.events(),
+            vec![
+                RemoteEvent::Failed {
+                    message: "timeout".to_string(),
+                    explicit: false
+                },
+                RemoteEvent::Skipped { explicit: false },
+                RemoteEvent::Failed {
+                    message: "timeout".to_string(),
+                    explicit: true
+                },
+                RemoteEvent::Skipped { explicit: false },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_backoff_is_keyed_on_url_model_and_dialect_only() {
+        let breaker = TestBreaker::new();
+        let config = remote_config("https://rerank.example.test/rerank");
+        assert_eq!(
+            breaker
+                .breaker
+                .score(&config, false, || Err(anyhow!("down"))),
+            None
+        );
+        // Another key or timeout is the same endpoint and stays held back.
+        let mut rekeyed = config.clone();
+        rekeyed.endpoint.api_key = Some("sk-other".to_string());
+        rekeyed.endpoint.timeout = Duration::from_secs(99);
+        assert_eq!(
+            breaker
+                .breaker
+                .score(&rekeyed, false, || panic!("held back")),
+            None
+        );
+        assert!(!format!("{:?}", breaker.breaker.lock_blocked()).contains("sk-other"));
+        let mut other_model = config.clone();
+        other_model.model = Some("other".to_string());
+        let mut other_dialect = config.clone();
+        other_dialect.dialect = RerankDialect::Texts;
+        for other in [other_model, other_dialect] {
+            assert_eq!(
+                breaker.breaker.score(&other, false, || Ok(vec![0.5])),
+                Some(vec![0.5])
+            );
+        }
+    }
+
+    #[test]
+    fn remote_texts_dialect_scores_through_the_shared_breaker() -> Result<()> {
+        use crate::test_support::remote_server::{join, reply, serve};
+        let (base, server) = serve(|_, body| {
+            let count = body["texts"].as_array().map_or(0, Vec::len);
+            let items: Vec<serde_json::Value> = (0..count)
+                .map(|index| serde_json::json!({"index": index, "score": 2.0 - index as f64}))
+                .collect();
+            reply(200, serde_json::Value::Array(items))
+        })?;
+        let mut remote = remote_config(&format!("{base}/rerank"));
+        remote.dialect = RerankDialect::Texts;
+        remote.model = None;
+        let settings = RerankSettings {
+            engine: RerankEngine::Remote(remote),
+            candidates: DEFAULT_RERANK_CANDIDATES,
+            doc_chars: DEFAULT_RERANK_DOC_CHARS,
+        };
+        let documents = vec!["one".to_string(), "two".to_string()];
+        let scores = score(&settings, false, "query", &documents)?.expect("scored");
+        let captured = join(server)?;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].body,
+            serde_json::json!({"query": "query", "texts": ["one", "two"], "truncate": true})
+        );
+        // Logits outside [0, 1] come back as probabilities.
+        assert_eq!(scores, vec![sigmoid(2.0)?, sigmoid(1.0)?]);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_failures_warn_once_per_error_and_backoff_window() {
+        let warned = Mutex::new(HashMap::new());
+        let start = Instant::now();
+        let mut out = Vec::new();
+        let window = REMOTE_FAILURE_BACKOFF;
+        assert!(warn_failure_once(&warned, "down", start, window, &mut out));
+        let almost = start + window - Duration::from_secs(1);
+        assert!(!warn_failure_once(
+            &warned, "down", almost, window, &mut out
+        ));
+        assert!(warn_failure_once(
+            &warned,
+            "down",
+            start + window,
+            window,
+            &mut out
+        ));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: reranking failed, keeping the original order: down\n".repeat(2)
+        );
     }
 
     #[test]
@@ -2046,18 +2538,21 @@ mod tests {
             &warned,
             "model download failed",
             start,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         assert!(!warn_failure_once(
             &warned,
             "model download failed",
             start,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         assert!(warn_failure_once(
             &warned,
             "tokenizer failed",
             start,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         let almost = start + LOAD_RETRY_DELAY - Duration::from_secs(1);
@@ -2065,6 +2560,7 @@ mod tests {
             &warned,
             "model download failed",
             almost,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         // A lasting failure warns again once per retry window.
@@ -2073,12 +2569,14 @@ mod tests {
             &warned,
             "model download failed",
             next_window,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         assert!(!warn_failure_once(
             &warned,
             "model download failed",
             next_window,
+            LOAD_RETRY_DELAY,
             &mut out
         ));
         assert_eq!(
@@ -2096,11 +2594,24 @@ mod tests {
                 &warned,
                 &format!("e{index}"),
                 start,
+                LOAD_RETRY_DELAY,
                 &mut out
             ));
         }
-        assert!(!warn_failure_once(&warned, "new", almost, &mut out));
-        assert!(warn_failure_once(&warned, "new", next_window, &mut out));
+        assert!(!warn_failure_once(
+            &warned,
+            "new",
+            almost,
+            LOAD_RETRY_DELAY,
+            &mut out
+        ));
+        assert!(warn_failure_once(
+            &warned,
+            "new",
+            next_window,
+            LOAD_RETRY_DELAY,
+            &mut out
+        ));
     }
 
     #[test]

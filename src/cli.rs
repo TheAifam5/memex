@@ -1079,7 +1079,7 @@ fn default_recency_half_life_days() -> f32 {
 // `Commands::augment_subcommands` stack frame.
 #[derive(Debug, Clone, Copy, Default, Args)]
 pub struct RerankArgs {
-    /// Rerank the leading results with the configured local model, loading it in this process
+    /// Rerank the leading results; a configured local model loads in this process
     #[arg(long, conflicts_with = "no_rerank", help_heading = "Tuning")]
     rerank: bool,
     /// Keep the retrieval order even when reranking is configured
@@ -1158,7 +1158,7 @@ pub(crate) struct SearchRequest {
     /// Machine IDs to search. Empty uses the configured defaults.
     #[serde(default)]
     pub(crate) machines: Vec<String>,
-    /// Rerank the leading conversation results with the configured local cross-encoder.
+    /// Rerank the leading conversation results with the configured local or remote reranker.
     /// Omit to follow the server configuration; false keeps the retrieval order, and true
     /// fails when reranking is not configured.
     #[serde(default)]
@@ -4512,7 +4512,7 @@ fn validate_rerank_request(config: &UserConfig) -> Result<()> {
     if config.rerank_mode() == crate::config::RerankMode::Off {
         return Err(anyhow!(
             "reranking was requested but is not configured; set rerank = \"local\" and \
-             rerank_model in config.toml"
+             rerank_model, or rerank = \"remote\", rerank_url, and rerank_model, in config.toml"
         ));
     }
     config.resolve_rerank()?;
@@ -9187,6 +9187,19 @@ mod tests {
         assert!(validate_rerank_request(&config).is_err());
         config.rerank_model = Some("jina-turbo".to_string());
         validate_rerank_request(&config).expect("configured");
+        let mut remote = UserConfig {
+            rerank: Some(crate::config::RerankMode::Remote),
+            rerank_model: Some("rerank-test".to_string()),
+            ..UserConfig::default()
+        };
+        let error = format!(
+            "{:#}",
+            validate_rerank_request(&remote).expect_err("no rerank_url")
+        );
+        assert!(error.contains("requires rerank_url"), "{error}");
+        remote.rerank_url = Some("http://127.0.0.1:9/rerank".to_string());
+        remote.rerank_api_key_env = Some("MEMEX_TEST_UNSET_RERANK_KEY".to_string());
+        validate_rerank_request(&remote).expect("remote configured");
     }
 
     #[test]

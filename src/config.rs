@@ -2,9 +2,11 @@ use crate::embed::{
     EmbedRuntimeConfig, ExecutionProviderChoice, LocalModel, ModelChoice, RemoteEmbedConfig,
 };
 use crate::remote_embed::{MAX_BATCH_SIZE, MAX_DIMENSIONS, RemoteEndpoint};
+use crate::remote_http::Purpose;
+use crate::remote_rerank::{RemoteRerankConfig, RerankDialect, RerankExtraBody};
 use crate::rerank::{
     DEFAULT_RERANK_CANDIDATES, DEFAULT_RERANK_DOC_CHARS, RERANK_CANDIDATES, RERANK_DOC_CHARS,
-    RerankSettings,
+    RerankEngine, RerankSettings,
 };
 use anyhow::{Context, Result, anyhow};
 use directories::BaseDirs;
@@ -100,6 +102,13 @@ const MAX_EMBEDDING_MAX_RETRIES: u32 = 10;
 /// Key variables consulted, in order, when neither `embedding_api_key` nor
 /// `embedding_api_key_env` is set.
 const DEFAULT_EMBEDDING_API_KEY_ENVS: [&str; 2] = ["MEMEX_EMBEDDING_API_KEY", "OPENAI_API_KEY"];
+const DEFAULT_RERANK_TIMEOUT_SECS: u64 = 10;
+/// Equal to the rerank time budget, so the budget never cuts a first attempt short.
+const MAX_RERANK_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_RERANK_MAX_RETRIES: u32 = 1;
+const MAX_RERANK_MAX_RETRIES: u32 = 3;
+/// Key variable consulted when neither `rerank_api_key` nor `rerank_api_key_env` is set.
+const DEFAULT_RERANK_API_KEY_ENV: &str = "MEMEX_RERANK_API_KEY";
 
 /// Value of the `embeddings` key: `true`/`"local"`, `"remote"`, or `false`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -168,12 +177,13 @@ impl Serialize for EmbeddingsMode {
     }
 }
 
-/// Value of the `rerank` key: `false` (default), or `true`/`"local"`.
+/// Value of the `rerank` key: `false` (default), `true`/`"local"`, or `"remote"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RerankMode {
     #[default]
     Off,
     Local,
+    Remote,
 }
 
 impl RerankMode {
@@ -181,6 +191,7 @@ impl RerankMode {
         match self {
             Self::Off => "off",
             Self::Local => "local",
+            Self::Remote => "remote",
         }
     }
 }
@@ -193,7 +204,7 @@ impl<'de> Deserialize<'de> for RerankMode {
             type Value = RerankMode;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("true, false, or \"local\"")
+                f.write_str("true, false, \"local\", or \"remote\"")
             }
 
             fn visit_bool<E: serde::de::Error>(
@@ -213,6 +224,7 @@ impl<'de> Deserialize<'de> for RerankMode {
             ) -> std::result::Result<Self::Value, E> {
                 match value {
                     "local" => Ok(RerankMode::Local),
+                    "remote" => Ok(RerankMode::Remote),
                     other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
                 }
             }
@@ -227,11 +239,12 @@ impl Serialize for RerankMode {
         match self {
             Self::Off => serializer.serialize_bool(false),
             Self::Local => serializer.serialize_str("local"),
+            Self::Remote => serializer.serialize_str("remote"),
         }
     }
 }
 
-/// A configured credential whose `Debug` output never contains the value.
+/// A configured credential or private value whose `Debug` output never contains it.
 #[derive(Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct SecretString(String);
@@ -303,15 +316,30 @@ pub struct UserConfig {
     pub cudnn_library_paths: Option<Vec<PathBuf>>,
     /// Embedding runtime compute units on macOS: ane, gpu, cpu, all
     pub compute_units: Option<String>,
-    /// Search reranking: true or "local", or false (default).
+    /// Search reranking: true or "local", "remote", or false (default).
     pub rerank: Option<RerankMode>,
-    /// Local cross-encoder: jina-turbo, bge-v2-m3, bge-base, or jina-v2; required when
-    /// reranking is on.
+    /// Required when reranking is on. Local: the cross-encoder, jina-turbo, bge-v2-m3,
+    /// bge-base, or jina-v2. Remote: the provider's model name, passed verbatim.
     pub rerank_model: Option<String>,
     /// Leading results rescored per search, 5..=100 (default 30).
     pub rerank_candidates: Option<usize>,
     /// Characters of each result sent to the reranker, 200..=8000 (default 1500).
     pub rerank_doc_chars: Option<usize>,
+    /// Full URL of the remote rerank endpoint, used verbatim; required for remote
+    /// reranking.
+    pub rerank_url: Option<String>,
+    /// Literal remote rerank API key; takes precedence over `rerank_api_key_env`.
+    pub rerank_api_key: Option<SecretString>,
+    /// Environment variable holding the remote rerank API key.
+    pub rerank_api_key_env: Option<String>,
+    /// Per-attempt remote rerank request timeout in seconds, 1..=30 (default 10).
+    pub rerank_timeout_secs: Option<u64>,
+    /// Retries for transient remote rerank failures, 0..=3 (default 1).
+    pub rerank_max_retries: Option<u32>,
+    /// Remote request body: "documents" (default) or "texts".
+    pub rerank_dialect: Option<RerankDialect>,
+    /// JSON object of extra top-level fields for every remote rerank request.
+    pub rerank_extra_body: Option<SecretString>,
     /// Scan cache TTL in seconds. If a scan was done within this time,
     /// skip re-scanning on search. Default: 3600 seconds (1 hour).
     pub scan_cache_ttl: Option<u64>,
@@ -668,9 +696,11 @@ impl UserConfig {
 
     /// Validate the reranking keys and resolve them; `None` when reranking is off.
     ///
-    /// `rerank_candidates`, `rerank_doc_chars`, and a configured `rerank_model` are checked
-    /// in every mode. Local reranking requires a model from `rerank_model`, else
-    /// `MEMEX_RERANK_MODEL`, and runs on the same ONNX Runtime settings as local embeddings.
+    /// `rerank_candidates` and `rerank_doc_chars` are checked in every mode. Local
+    /// reranking requires a model from `rerank_model`, else `MEMEX_RERANK_MODEL`, runs on
+    /// the same ONNX Runtime settings as local embeddings, and ignores the remote keys.
+    /// Remote reranking requires `rerank_url`, and `rerank_model` unless the dialect is
+    /// `"texts"`; it never reads `MEMEX_RERANK_MODEL` and ignores the ONNX Runtime keys.
     pub fn resolve_rerank(&self) -> Result<Option<RerankSettings>> {
         let candidates = self.rerank_candidates.unwrap_or(DEFAULT_RERANK_CANDIDATES);
         if !RERANK_CANDIDATES.contains(&candidates) {
@@ -688,37 +718,128 @@ impl UserConfig {
                 RERANK_DOC_CHARS.end()
             ));
         }
-        let configured_model = self
-            .rerank_model
-            .as_deref()
-            .map(|name| crate::rerank::parse_model(name).context("invalid rerank_model"))
-            .transpose()?;
-        if self.rerank_mode() == RerankMode::Off {
-            return Ok(None);
-        }
-        let model = match configured_model {
-            Some(model) => model,
-            None => match std::env::var("MEMEX_RERANK_MODEL") {
-                Ok(name) => {
-                    crate::rerank::parse_model(&name).context("invalid MEMEX_RERANK_MODEL")?
+        let engine = match self.rerank_mode() {
+            RerankMode::Off => return Ok(None),
+            RerankMode::Local => {
+                let model = match self.rerank_model_name()? {
+                    Some((name, source)) => crate::rerank::parse_model(&name)
+                        .with_context(|| format!("invalid {source}"))?,
+                    None => {
+                        return Err(anyhow!(
+                            "rerank = \"local\" requires rerank_model, one of: {}",
+                            crate::rerank::SUPPORTED_MODEL_NAMES
+                        ));
+                    }
+                };
+                RerankEngine::Local {
+                    model,
+                    runtime: self.resolve_onnx_runtime()?,
                 }
-                Err(std::env::VarError::NotPresent) => {
-                    return Err(anyhow!(
-                        "rerank = \"local\" requires rerank_model, one of: {}",
-                        crate::rerank::SUPPORTED_MODEL_NAMES
-                    ));
-                }
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    return Err(anyhow!("MEMEX_RERANK_MODEL is not valid unicode"));
-                }
-            },
+            }
+            RerankMode::Remote => RerankEngine::Remote(self.resolve_remote_rerank()?),
         };
         Ok(Some(RerankSettings {
-            model,
+            engine,
             candidates,
             doc_chars,
-            runtime: self.resolve_onnx_runtime()?,
         }))
+    }
+
+    /// The configured `rerank_model`, else `MEMEX_RERANK_MODEL`, with the name of its
+    /// source for error messages.
+    fn rerank_model_name(&self) -> Result<Option<(String, &'static str)>> {
+        if let Some(name) = &self.rerank_model {
+            return Ok(Some((name.clone(), "rerank_model")));
+        }
+        match std::env::var("MEMEX_RERANK_MODEL") {
+            Ok(name) => Ok(Some((name, "MEMEX_RERANK_MODEL"))),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(anyhow!("MEMEX_RERANK_MODEL is not valid unicode"))
+            }
+        }
+    }
+
+    fn resolve_remote_rerank(&self) -> Result<RemoteRerankConfig> {
+        // MEMEX_RERANK_MODEL names a local model, so it never reaches a hosted API.
+        let dialect = self.rerank_dialect.unwrap_or_default();
+        let model = match (&self.rerank_model, dialect) {
+            (Some(name), _) => {
+                crate::remote_rerank::validate_model_name(name).context("invalid rerank_model")?;
+                Some(name.clone())
+            }
+            (None, RerankDialect::Texts) => None,
+            (None, RerankDialect::Documents) => {
+                return Err(anyhow!(
+                    "rerank = \"remote\" requires rerank_model to name the provider's rerank \
+                     model, unless rerank_dialect = \"texts\""
+                ));
+            }
+        };
+        let url = self
+            .rerank_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "rerank = \"remote\" requires rerank_url, the full endpoint URL, for example \
+                     \"https://openrouter.ai/api/v1/rerank\""
+                )
+            })?;
+        let timeout_secs = self
+            .rerank_timeout_secs
+            .unwrap_or(DEFAULT_RERANK_TIMEOUT_SECS);
+        if !(1..=MAX_RERANK_TIMEOUT_SECS).contains(&timeout_secs) {
+            return Err(anyhow!(
+                "rerank_timeout_secs must be between 1 and {MAX_RERANK_TIMEOUT_SECS}, got \
+                 {timeout_secs}"
+            ));
+        }
+        let max_retries = self
+            .rerank_max_retries
+            .unwrap_or(DEFAULT_RERANK_MAX_RETRIES);
+        if max_retries > MAX_RERANK_MAX_RETRIES {
+            return Err(anyhow!(
+                "rerank_max_retries must be between 0 and {MAX_RERANK_MAX_RETRIES}, got \
+                 {max_retries}"
+            ));
+        }
+        let endpoint = RemoteEndpoint {
+            base_url: url.to_string(),
+            api_key: self.resolve_rerank_api_key()?,
+            timeout: Duration::from_secs(timeout_secs),
+            max_retries,
+        };
+        endpoint.validate_for(Purpose::Rerank)?;
+        let extra_body = match &self.rerank_extra_body {
+            Some(source) => {
+                RerankExtraBody::parse(source.expose()).context("invalid rerank_extra_body")?
+            }
+            None => None,
+        };
+        Ok(RemoteRerankConfig {
+            endpoint,
+            model,
+            dialect,
+            extra_body,
+        })
+    }
+
+    /// Resolve the remote rerank API key: the literal `rerank_api_key`, else the variable
+    /// named by `rerank_api_key_env` (and only that one), else `MEMEX_RERANK_API_KEY`.
+    /// Empty values count as unset, and no key is allowed.
+    pub fn resolve_rerank_api_key(&self) -> Result<Option<String>> {
+        if let Some(key) = &self.rerank_api_key
+            && !key.expose().is_empty()
+        {
+            return Ok(Some(key.expose().to_string()));
+        }
+        api_key_from_env(
+            self.rerank_api_key_env
+                .as_deref()
+                .unwrap_or(DEFAULT_RERANK_API_KEY_ENV),
+        )
     }
 
     fn resolve_embedding_batch_size(&self) -> Result<Option<usize>> {
@@ -926,6 +1047,13 @@ const USER_CONFIG_KEYS: &[&str] = &[
     "rerank_model",
     "rerank_candidates",
     "rerank_doc_chars",
+    "rerank_url",
+    "rerank_api_key",
+    "rerank_api_key_env",
+    "rerank_timeout_secs",
+    "rerank_max_retries",
+    "rerank_dialect",
+    "rerank_extra_body",
     "scan_cache_ttl",
     "max_indexed_tool_input_bytes",
     "max_indexed_tool_output_bytes",
@@ -1345,12 +1473,27 @@ mod tests {
             (
                 "rerank = \"sk-secret\"\n",
                 "sk-secret",
-                "rerank: invalid value, expected true, false, or \"local\"",
+                "rerank: invalid value, expected true, false, \"local\", or \"remote\"",
+            ),
+            (
+                "rerank_dialect = \"sk-secret\"\n",
+                "sk-secret",
+                "unknown variant, expected documents or texts",
+            ),
+            (
+                "rerank_api_key = 12345678\n",
+                "12345678",
+                "rerank_api_key: wrong value type, expected a string",
             ),
             (
                 "rerank_candidates = -3\n",
                 "-3",
                 "rerank_candidates: invalid value, expected usize",
+            ),
+            (
+                "rerank_extra_body = { provider = \"sk-secret\" }\n",
+                "sk-secret",
+                "rerank_extra_body: wrong value type, expected a string",
             ),
         ] {
             let error = UserConfig::parse(contents)
@@ -2116,18 +2259,19 @@ mod tests {
     }
 
     #[test]
-    fn rerank_accepts_bool_or_local() {
+    fn rerank_accepts_bool_local_or_remote() {
         for (value, mode) in [
             ("true", RerankMode::Local),
             ("false", RerankMode::Off),
             ("\"local\"", RerankMode::Local),
+            ("\"remote\"", RerankMode::Remote),
         ] {
             let config: UserConfig =
                 toml::from_str(&format!("rerank = {value}")).expect("parse rerank");
             assert_eq!(config.rerank_mode(), mode, "{value}");
         }
         assert_eq!(UserConfig::default().rerank_mode(), RerankMode::Off);
-        assert!(toml::from_str::<UserConfig>(r#"rerank = "remote""#).is_err());
+        assert!(toml::from_str::<UserConfig>(r#"rerank = "cloud""#).is_err());
         assert!(toml::from_str::<UserConfig>("rerank = 1").is_err());
     }
 
@@ -2155,16 +2299,14 @@ mod tests {
             .resolve_rerank()
             .expect("resolve rerank")
             .expect("rerank on");
-        assert_eq!(settings.model, fastembed::RerankerModel::BGERerankerV2M3);
+        let (model, runtime) = local_engine(&settings);
+        assert_eq!(*model, fastembed::RerankerModel::BGERerankerV2M3);
         assert_eq!(settings.candidates, DEFAULT_RERANK_CANDIDATES);
         assert_eq!(settings.doc_chars, DEFAULT_RERANK_DOC_CHARS);
         // Remote embeddings ignore the ONNX keys; the local reranker still uses them.
-        assert_eq!(
-            settings.runtime.execution_provider,
-            ExecutionProviderChoice::Cpu
-        );
-        assert_eq!(settings.runtime.cuda_device_id, Some(2));
-        assert_eq!(settings.runtime.remote, None);
+        assert_eq!(runtime.execution_provider, ExecutionProviderChoice::Cpu);
+        assert_eq!(runtime.cuda_device_id, Some(2));
+        assert_eq!(runtime.remote, None);
         let local = UserConfig {
             embeddings: Some(EmbeddingsMode::Local),
             embedding_base_url: None,
@@ -2172,12 +2314,26 @@ mod tests {
         };
         let embed_runtime = local.resolve_embed_runtime().expect("embed runtime");
         assert_eq!(
-            settings.runtime,
+            *runtime,
             EmbedRuntimeConfig {
                 batch_size: None,
                 ..embed_runtime
             }
         );
+    }
+
+    fn local_engine(settings: &RerankSettings) -> (&fastembed::RerankerModel, &EmbedRuntimeConfig) {
+        match &settings.engine {
+            RerankEngine::Local { model, runtime } => (model, runtime),
+            RerankEngine::Remote(_) => panic!("expected a local reranker"),
+        }
+    }
+
+    fn remote_engine(settings: &RerankSettings) -> &RemoteRerankConfig {
+        match &settings.engine {
+            RerankEngine::Remote(remote) => remote,
+            RerankEngine::Local { .. } => panic!("expected a remote reranker"),
+        }
     }
 
     #[test]
@@ -2203,19 +2359,19 @@ mod tests {
             let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", Some("jina-turbo"))]);
             let settings = local.resolve_rerank().expect("env model").expect("on");
             assert_eq!(
-                settings.model,
+                *local_engine(&settings).0,
                 fastembed::RerankerModel::JINARerankerV1TurboEn
             );
             let configured = UserConfig {
                 rerank_model: Some("bge-base".to_string()),
                 ..local.clone()
             };
+            let settings = configured
+                .resolve_rerank()
+                .expect("config model")
+                .expect("on");
             assert_eq!(
-                configured
-                    .resolve_rerank()
-                    .expect("config model")
-                    .expect("on")
-                    .model,
+                *local_engine(&settings).0,
                 fastembed::RerankerModel::BGERerankerBase
             );
         }
@@ -2228,15 +2384,22 @@ mod tests {
             assert_eq!(UserConfig::default().resolve_rerank().expect("off"), None);
         }
         let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        // The model name depends on the mode, so it is checked only when reranking is on.
         let unknown = UserConfig {
             rerank_model: Some("ms-marco".to_string()),
             ..UserConfig::default()
         };
+        assert_eq!(unknown.resolve_rerank().expect("off"), None);
         let error = format!(
             "{:#}",
-            unknown.resolve_rerank().expect_err("checked when off")
+            UserConfig {
+                rerank: Some(RerankMode::Local),
+                ..unknown
+            }
+            .resolve_rerank()
+            .expect_err("unknown local model")
         );
-        assert!(error.contains("rerank_model"), "{error}");
+        assert!(error.contains("invalid rerank_model"), "{error}");
         for (candidates, doc_chars, key) in [
             (Some(4), None, "rerank_candidates"),
             (Some(101), None, "rerank_candidates"),
@@ -2653,5 +2816,288 @@ mod tests {
             .resolve_embed_runtime()
             .expect("resolve remote runtime");
         assert!(!format!("{runtime:?}").contains("sk-literal"));
+    }
+
+    fn remote_rerank_config() -> UserConfig {
+        toml::from_str(
+            r#"
+                rerank = "remote"
+                rerank_url = " https://openrouter.ai/api/v1/rerank "
+                rerank_model = "cohere/rerank-v3.5"
+                rerank_api_key = "sk-rerank-literal"
+                execution_provider = "not-a-provider"
+                cuda_device_id = 3
+            "#,
+        )
+        .expect("parse remote rerank config")
+    }
+
+    #[test]
+    fn remote_rerank_resolves_defaults_and_ignores_runtime_keys() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        let config = remote_rerank_config();
+        let settings = config.resolve_rerank().expect("resolve").expect("on");
+        assert_eq!(settings.candidates, DEFAULT_RERANK_CANDIDATES);
+        assert_eq!(settings.doc_chars, DEFAULT_RERANK_DOC_CHARS);
+        let remote = remote_engine(&settings);
+        assert_eq!(remote.model.as_deref(), Some("cohere/rerank-v3.5"));
+        assert_eq!(remote.dialect, RerankDialect::Documents);
+        assert_eq!(
+            remote.endpoint,
+            RemoteEndpoint {
+                base_url: "https://openrouter.ai/api/v1/rerank".to_string(),
+                api_key: Some("sk-rerank-literal".to_string()),
+                timeout: Duration::from_secs(10),
+                max_retries: 1,
+            }
+        );
+        assert!(!format!("{config:?}").contains("sk-rerank-literal"));
+        assert!(!format!("{settings:?}").contains("sk-rerank-literal"));
+
+        let tuned = UserConfig {
+            rerank_timeout_secs: Some(30),
+            rerank_max_retries: Some(0),
+            rerank_dialect: Some(RerankDialect::Texts),
+            rerank_candidates: Some(50),
+            rerank_doc_chars: Some(4000),
+            ..config.clone()
+        };
+        let settings = tuned.resolve_rerank().expect("resolve").expect("on");
+        assert_eq!((settings.candidates, settings.doc_chars), (50, 4000));
+        let remote = remote_engine(&settings);
+        assert_eq!(remote.dialect, RerankDialect::Texts);
+        assert_eq!(remote.endpoint.timeout, Duration::from_secs(30));
+        assert_eq!(remote.endpoint.max_retries, 0);
+        let parsed: UserConfig = toml::from_str("rerank_dialect = \"texts\"").expect("dialect");
+        assert_eq!(parsed.rerank_dialect, Some(RerankDialect::Texts));
+    }
+
+    #[test]
+    fn remote_rerank_validates_url_model_and_bounds() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", None)]);
+        let base = remote_rerank_config();
+        let error = |config: UserConfig| {
+            format!(
+                "{:#}",
+                config.resolve_rerank().expect_err("invalid remote rerank")
+            )
+        };
+        for (config, expected) in [
+            (
+                UserConfig {
+                    rerank_url: None,
+                    ..base.clone()
+                },
+                "requires rerank_url",
+            ),
+            (
+                UserConfig {
+                    rerank_url: Some("  ".to_string()),
+                    ..base.clone()
+                },
+                "requires rerank_url",
+            ),
+            (
+                UserConfig {
+                    rerank_url: Some("ftp://rerank.example.test/rerank".to_string()),
+                    ..base.clone()
+                },
+                "rerank URL",
+            ),
+            (
+                UserConfig {
+                    rerank_url: Some("http://rerank.example.test/rerank".to_string()),
+                    ..base.clone()
+                },
+                "use https or a loopback host",
+            ),
+            (
+                UserConfig {
+                    rerank_model: None,
+                    ..base.clone()
+                },
+                "requires rerank_model",
+            ),
+            (
+                UserConfig {
+                    rerank_model: Some(String::new()),
+                    ..base.clone()
+                },
+                "invalid rerank_model",
+            ),
+            (
+                UserConfig {
+                    rerank_model: Some("a b".to_string()),
+                    ..base.clone()
+                },
+                "whitespace or control",
+            ),
+            (
+                UserConfig {
+                    rerank_model: Some("m".repeat(201)),
+                    ..base.clone()
+                },
+                "longer than 200",
+            ),
+            (
+                UserConfig {
+                    rerank_timeout_secs: Some(0),
+                    ..base.clone()
+                },
+                "rerank_timeout_secs must be between 1 and 30, got 0",
+            ),
+            (
+                UserConfig {
+                    rerank_timeout_secs: Some(31),
+                    ..base.clone()
+                },
+                "rerank_timeout_secs must be between 1 and 30, got 31",
+            ),
+            (
+                UserConfig {
+                    rerank_max_retries: Some(4),
+                    ..base.clone()
+                },
+                "rerank_max_retries must be between 0 and 3, got 4",
+            ),
+            (
+                UserConfig {
+                    rerank_candidates: Some(101),
+                    ..base.clone()
+                },
+                "rerank_candidates",
+            ),
+            (
+                UserConfig {
+                    rerank_extra_body: Some(SecretString(
+                        "{\"provider\": sk-extra-secret}".to_string(),
+                    )),
+                    ..base.clone()
+                },
+                "invalid rerank_extra_body: is not valid JSON",
+            ),
+            (
+                UserConfig {
+                    rerank_extra_body: Some(SecretString(
+                        "{\"query\": \"sk-extra-secret\"}".to_string(),
+                    )),
+                    ..base.clone()
+                },
+                "invalid rerank_extra_body: must not set `query`",
+            ),
+        ] {
+            let message = error(config);
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("sk-rerank-literal"), "{message}");
+            assert!(!message.contains("sk-extra-secret"), "{message}");
+        }
+        let extra = UserConfig {
+            rerank_extra_body: Some(SecretString(
+                "{\"provider\": {\"data_collection\": \"deny\"}}".to_string(),
+            )),
+            ..base.clone()
+        };
+        let settings = extra.resolve_rerank().expect("extra body").expect("on");
+        assert!(remote_engine(&settings).extra_body.is_some());
+        assert!(!format!("{extra:?} {settings:?}").contains("data_collection"));
+        // Plain http is accepted without a key and to loopback hosts with one.
+        for (url, key) in [
+            ("http://rerank.example.test/rerank", None),
+            ("http://127.0.0.1:8080/rerank", Some("sk-rerank-literal")),
+        ] {
+            let config = UserConfig {
+                rerank_url: Some(url.to_string()),
+                rerank_api_key: key.map(|key| SecretString(key.to_string())),
+                rerank_api_key_env: Some("MEMEX_TEST_UNSET_RERANK_KEY".to_string()),
+                ..base.clone()
+            };
+            assert!(config.resolve_rerank().is_ok(), "{url}");
+        }
+        {
+            // The local model variable never reaches a hosted API.
+            let _env = EnvVarGuard::set(&[("MEMEX_RERANK_MODEL", Some("jina-turbo"))]);
+            let unnamed = UserConfig {
+                rerank_model: None,
+                ..base.clone()
+            };
+            assert!(error(unnamed.clone()).contains("requires rerank_model"));
+            let texts = UserConfig {
+                rerank_dialect: Some(RerankDialect::Texts),
+                ..unnamed
+            };
+            let settings = texts.resolve_rerank().expect("texts").expect("on");
+            assert_eq!(remote_engine(&settings).model, None);
+            let message = error(UserConfig {
+                rerank_model: Some("bad model".to_string()),
+                ..texts
+            });
+            assert!(message.contains("invalid rerank_model"), "{message}");
+        }
+        // Local reranking ignores the remote keys.
+        let local = UserConfig {
+            rerank: Some(RerankMode::Local),
+            rerank_model: Some("jina-turbo".to_string()),
+            rerank_url: Some("not a url".to_string()),
+            rerank_timeout_secs: Some(0),
+            rerank_max_retries: Some(99),
+            rerank_extra_body: Some(SecretString("not json".to_string())),
+            execution_provider: None,
+            ..base
+        };
+        let settings = local.resolve_rerank().expect("local").expect("on");
+        assert_eq!(
+            *local_engine(&settings).0,
+            fastembed::RerankerModel::JINARerankerV1TurboEn
+        );
+    }
+
+    #[test]
+    fn rerank_api_key_lookup_precedence() {
+        let _guard = env_lock();
+        let _env = EnvVarGuard::set(&[
+            ("MEMEX_RERANK_API_KEY", Some("memex-rerank-key")),
+            ("MEMEX_TEST_RERANK_KEY", Some("custom-key")),
+            ("MEMEX_TEST_MISSING_RERANK_KEY", None),
+            ("MEMEX_EMBEDDING_API_KEY", Some("embedding-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+        ]);
+        let resolve = |config: UserConfig| config.resolve_rerank_api_key().expect("key");
+        assert_eq!(
+            resolve(UserConfig {
+                rerank_api_key: Some(SecretString("literal-key".to_string())),
+                rerank_api_key_env: Some("MEMEX_TEST_RERANK_KEY".to_string()),
+                ..UserConfig::default()
+            })
+            .as_deref(),
+            Some("literal-key")
+        );
+        assert_eq!(
+            resolve(UserConfig {
+                rerank_api_key: Some(SecretString(String::new())),
+                rerank_api_key_env: Some("MEMEX_TEST_RERANK_KEY".to_string()),
+                ..UserConfig::default()
+            })
+            .as_deref(),
+            Some("custom-key")
+        );
+        // A named variable is the only one read.
+        assert_eq!(
+            resolve(UserConfig {
+                rerank_api_key_env: Some("MEMEX_TEST_MISSING_RERANK_KEY".to_string()),
+                ..UserConfig::default()
+            }),
+            None
+        );
+        assert_eq!(
+            resolve(UserConfig::default()).as_deref(),
+            Some("memex-rerank-key")
+        );
+        // The embedding keys are never used, and an empty variable counts as unset.
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_API_KEY", Some(""))]);
+        assert_eq!(resolve(UserConfig::default()), None);
+        let _env = EnvVarGuard::set(&[("MEMEX_RERANK_API_KEY", None)]);
+        assert_eq!(resolve(UserConfig::default()), None);
     }
 }
