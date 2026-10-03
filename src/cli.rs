@@ -8104,8 +8104,6 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
 
 const REPO: &str = "nicosuave/memex";
 
-const HOMEBREW_FORMULA: &str = "nicosuave/tap/memex";
-
 fn interaction_allowed(
     explicitly_disabled: bool,
     stdin_tty: bool,
@@ -8140,17 +8138,51 @@ fn homebrew_executable(path: &Path) -> bool {
         .any(|pair| pair[0].as_os_str() == "Cellar" && pair[1].as_os_str() == "memex")
 }
 
-fn is_homebrew_install() -> bool {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.canonicalize().ok())
-        .is_some_and(|path| homebrew_executable(&path))
+// The receipt preserves ownership when core and a third-party tap both contain memex.
+fn homebrew_formula(current_exe: &Path) -> Result<String> {
+    let keg = current_exe
+        .parent()
+        .and_then(Path::parent)
+        .context("Homebrew binary has no installation directory")?;
+    let receipt_path = keg.join("INSTALL_RECEIPT.json");
+    let receipt = std::fs::read(&receipt_path).with_context(|| {
+        format!(
+            "read Homebrew installation receipt {}",
+            receipt_path.display()
+        )
+    })?;
+    let receipt: serde_json::Value = serde_json::from_slice(&receipt)
+        .context("parse Homebrew installation receipt; use brew to upgrade manually")?;
+    let tap = receipt
+        .pointer("/source/tap")
+        .and_then(serde_json::Value::as_str)
+        .context("Homebrew installation receipt has no source tap; use brew to upgrade manually")?;
+    let parts: Vec<_> = tap.split('/').collect();
+    anyhow::ensure!(
+        parts.len() == 2
+            && parts.iter().all(|part| {
+                part.bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            }),
+        "Homebrew installation receipt has an invalid source tap; use brew to upgrade manually"
+    );
+    if tap == "homebrew/core" {
+        Ok("memex".to_string())
+    } else {
+        Ok(format!("{tap}/memex"))
+    }
 }
 
 fn confirm_update() -> Result<bool> {
     use dialoguer::{Confirm, theme::ColorfulTheme};
-    if is_homebrew_install() {
-        eprintln!("brew update && brew upgrade {HOMEBREW_FORMULA}");
+    let current_exe = std::env::current_exe()?.canonicalize()?;
+    if homebrew_executable(&current_exe) {
+        let formula = homebrew_formula(&current_exe)?;
+        eprintln!("brew update && brew upgrade {formula}");
     }
     eprintln!(
         "Existing memex-search skill copies will also be replaced with the installed version; missing copies stay uninstalled."
@@ -8188,8 +8220,8 @@ fn activate_installed_daemon(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBuf> {
-    for args in [vec!["update"], vec!["upgrade", HOMEBREW_FORMULA]] {
+fn update_homebrew(brew: &Path, formula: &str, expected_version: Option<&str>) -> Result<PathBuf> {
+    for args in [vec!["update"], vec!["upgrade", formula]] {
         let status = std::process::Command::new(brew)
             .args(&args)
             .env("HOMEBREW_NO_AUTO_UPDATE", "1")
@@ -8205,13 +8237,13 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
     }
     // The running executable can live in an old Cellar version that brew just removed.
     let output = std::process::Command::new(brew)
-        .args(["--prefix", HOMEBREW_FORMULA])
+        .args(["--prefix", formula])
         .stdin(std::process::Stdio::null())
         .output()
         .context("locate the installed Homebrew memex")?;
     if !output.status.success() {
         return Err(anyhow!(
-            "Homebrew upgrade finished, but `brew --prefix {HOMEBREW_FORMULA}` failed; run `memex skill update` after resolving the installation"
+            "Homebrew upgrade finished, but `brew --prefix {formula}` failed; run `memex skill update` after resolving the installation"
         ));
     }
     let prefix = std::str::from_utf8(&output.stdout)
@@ -8243,7 +8275,7 @@ fn update_homebrew(brew: &Path, expected_version: Option<&str>) -> Result<PathBu
     refresh_installed_skills(&binary)?;
     if expected_version.is_some_and(|latest| is_newer_version(installed_version, latest)) {
         return Err(anyhow!(
-            "Homebrew still provides memex v{installed_version}; release v{} is newer. The tap may not have caught up or the formula may be pinned. Installed skills were refreshed; retry `memex update` later",
+            "Homebrew still provides memex v{installed_version}; release v{} is newer. The formula may not have caught up or may be pinned. Installed skills were refreshed; retry `memex update` later",
             expected_version.unwrap()
         ));
     }
@@ -8331,7 +8363,8 @@ fn perform_update(known_latest: Option<&str>) -> Result<()> {
         let brew = find_in_path("brew").ok_or_else(|| {
             anyhow!("Homebrew manages this installation, but brew is not on PATH")
         })?;
-        update_homebrew(&brew, known_latest)?;
+        let formula = homebrew_formula(&current_exe)?;
+        update_homebrew(&brew, &formula, known_latest)?;
     } else {
         let fetched;
         let latest = match known_latest {

@@ -136,7 +136,10 @@ For Claude Code, use `memex skill install --target claude`; its copy lives at
 Launching `memex` in a human terminal offers an update when a newer release is
 available. Press Enter to update Memex and refresh its installed skill copies, or
 choose no to continue into the TUI. Homebrew installs run `brew update` followed by
-`brew upgrade nicosuave/tap/memex`; skills are refreshed by the newly installed binary.
+`brew upgrade` for the formula recorded in the installation receipt (`memex` for
+Homebrew core, or the fully qualified tap formula); skills are refreshed by the
+newly installed binary. If the receipt is missing or invalid, Memex stops before
+running Homebrew; use `brew` directly to upgrade that installation.
 After updating, run `memex` again to start that version.
 
 Enabled daemons follow binary upgrades automatically between indexing passes.

@@ -61,6 +61,16 @@ impl Fixture {
         // A hard link preserves the simulated Cellar path (unlike a symlink)
         // without creating another executable or changing the build's permissions.
         std::fs::hard_link(executable, &cellar_memex).unwrap();
+        std::fs::write(
+            cellar_memex
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("INSTALL_RECEIPT.json"),
+            r#"{"source":{"tap":"nicosuave/tap"}}"#,
+        )
+        .unwrap();
 
         write_script(
             &bin.join("brew"),
@@ -225,6 +235,15 @@ esac
 
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn receipt_path(&self) -> PathBuf {
+        self.cellar_memex
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("INSTALL_RECEIPT.json")
     }
 }
 
@@ -474,6 +493,60 @@ fn update_requires_yes_without_a_tty_and_yes_runs_installed_binary_chain() {
         fixture.log(),
         "brew update\nbrew upgrade nicosuave/tap/memex\nbrew --prefix nicosuave/tap/memex\ninstalled --version\ninstalled --no-update-check daemon reconcile\ninstalled skill update --target all\n"
     );
+}
+
+#[test]
+fn homebrew_update_uses_the_installed_formula_source() {
+    for (tap, formula) in [
+        ("homebrew/core", "memex"),
+        ("another-owner/tools", "another-owner/tools/memex"),
+    ] {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.receipt_path(),
+            serde_json::json!({"source": {"tap": tap}}).to_string(),
+        )
+        .unwrap();
+        let output = run(fixture.command().args(["update", "--yes"]));
+        assert!(
+            output.status.success(),
+            "{tap}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fixture.log(),
+            format!(
+                "brew update\nbrew upgrade {formula}\nbrew --prefix {formula}\ninstalled --version\ninstalled --no-update-check daemon reconcile\ninstalled skill update --target all\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn homebrew_update_refuses_an_unknown_source_before_mutation() {
+    for (receipt, error) in [
+        (None, "read Homebrew installation receipt"),
+        (Some("not json"), "parse Homebrew installation receipt"),
+        (Some(r#"{"source":{}}"#), "has no source tap"),
+        (
+            Some(r#"{"source":{"tap":"--invalid/tap"}}"#),
+            "has an invalid source tap",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        match receipt {
+            Some(receipt) => std::fs::write(fixture.receipt_path(), receipt).unwrap(),
+            None => std::fs::remove_file(fixture.receipt_path()).unwrap(),
+        }
+        let output = run(fixture.command().args(["update", "--yes"]));
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(error),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fixture.log().is_empty());
+    }
 }
 
 #[test]
