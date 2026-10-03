@@ -119,8 +119,8 @@ together instead of comparing separately computed embeddings. It uses the same
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `rerank` | `false` | `false`, or `true` / `"local"` |
-| `rerank_model` | none | Model to use; required when reranking is on. Falls back to `MEMEX_RERANK_MODEL` |
+| `rerank` | `false` | `false`, `true` / `"local"`, or `"remote"` ([hosted](#hosted-reranking)) |
+| `rerank_model` | none | Model to use; required for local reranking. Falls back to `MEMEX_RERANK_MODEL` |
 | `rerank_candidates` | 30 | Top results to rerank (5 to 100) |
 | `rerank_doc_chars` | 1500 | Characters of each result sent to the model (200 to 8000) |
 
@@ -141,8 +141,9 @@ How it works:
 - On any reranker failure, the original order is kept and a warning is printed.
 
 When it runs: the daemon and MCP server load the model in the background and rerank once it
-is ready. A one-shot `memex search` reranks only with `--rerank`, which loads the model
-first; `--no-rerank` turns reranking off for one run. MCP `search` takes `rerank: true` or
+is ready. A one-shot `memex search` reranks locally only with `--rerank`, which loads the
+model first; remote reranking loads no model and runs in every search, including one-shot
+ones. `--no-rerank` turns reranking off for one run. MCP `search` takes `rerank: true` or
 `false`. The TUI and web UI search never rerank.
 
 In our tests, hosted rerankers improved results more than these local models; local
@@ -152,6 +153,34 @@ reranking is for privacy and offline use.
 rerank = "local"
 rerank_model = "jina-turbo"
 ```
+
+### Hosted reranking
+
+`rerank = "remote"` loads no model and calls a Cohere-style `/rerank` API: OpenRouter, Cohere, Voyage,
+Jina, vLLM, llama.cpp (`--reranking`), or text-embeddings-inference (not Ollama). On two public
+benchmarks, hosted rerankers gained about 0.07 to 0.16 nDCG@10 at 0.3 to 0.7 s per query.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `rerank_url` | none | Full endpoint URL; nothing is appended. No `top_n` is sent |
+| `rerank_model` | none | Provider model name, such as `cohere/rerank-v3.5`; optional with `"texts"`. `MEMEX_RERANK_MODEL` is not read |
+| `rerank_api_key` / `rerank_api_key_env` | none | Literal key, or the only variable read for it; else `MEMEX_RERANK_API_KEY`. Optional for local servers |
+| `rerank_timeout_secs` / `rerank_max_retries` | 10 / 1 | Request timeout in seconds (1 to 30) / retries (0 to 3); attempts stop at the 30 s budget |
+| `rerank_dialect` | `"documents"` | `"texts"` for text-embeddings-inference (sends `truncate: true`); such servers cap the batch, often at 32, so lower `rerank_candidates` if requests are rejected |
+
+Every search that reranks, one-shot CLI and native app included, sends the query and up to
+`rerank_candidates` × `rerank_doc_chars` characters of result text to `rerank_url`; plain `http://`
+is rejected for non-loopback hosts when a key is set. Scores outside 0 to 1 are treated as logits
+(sigmoid; order unchanged). A search spends at most about 30 s reranking. On failure the order is
+kept with a warning; the daemon and MCP server then pause it for 60 s, and one-shot runs retry.
+
+```toml
+rerank = "remote"
+rerank_url = "https://openrouter.ai/api/v1/rerank"
+rerank_model = "cohere/rerank-v3.5"
+rerank_api_key_env = "OPENROUTER_API_KEY"
+```
+
 ## Config (optional)
 
 Create `~/.memex/config.toml` (or `<root>/config.toml` if you use `--root`):
@@ -174,8 +203,8 @@ cuda_device_id = 0  # optional, when execution_provider = "cuda"
 cuda_library_paths = ["/usr/local/cuda/lib64"]  # optional list of CUDA library dirs
 cudnn_library_paths = ["/usr/lib/x86_64-linux-gnu"]  # optional list of cuDNN library dirs
 compute_units = "ane"  # CoreML only: ane, gpu, cpu, all
-rerank = false  # true or "local" to rerank results with a local cross-encoder
-# rerank_model = "jina-turbo"  # required when rerank is on
+rerank = false  # true or "local" for a local cross-encoder, "remote" for a hosted /rerank API
+# rerank_model = "jina-turbo"  # required for local reranking
 rerank_candidates = 30  # 5 to 100
 rerank_doc_chars = 1500  # 200 to 8000
 scan_cache_ttl = 3600  # seconds (default 1 hour)

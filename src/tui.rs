@@ -7303,11 +7303,16 @@ mod tests {
         let spec = federated_search_spec(&request, Some("memex"));
         assert_eq!(spec.rerank, Some(false));
         assert_eq!(spec.project.as_deref(), Some("memex"));
-        // Reranking is configured, but the explicit opt-out wins in every process.
-        assert_eq!(
-            crate::rerank::decide(true, spec.rerank, true, &spec.query),
-            crate::rerank::RerankDecision::Skip
-        );
+        // Reranking is configured, but the explicit opt-out wins in every process and mode.
+        for mode in [
+            crate::config::RerankMode::Local,
+            crate::config::RerankMode::Remote,
+        ] {
+            assert_eq!(
+                crate::rerank::decide(mode, spec.rerank, true, &spec.query),
+                crate::rerank::RerankDecision::Skip
+            );
+        }
     }
 
     #[test]
