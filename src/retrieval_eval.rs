@@ -8,7 +8,7 @@
 use crate::config::Paths;
 use crate::machine::LocatedRecord;
 use crate::retrieval::canonical_record_id;
-use crate::types::SourceKind;
+use crate::types::{SourceFilter, SourceKind};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -308,15 +308,32 @@ pub struct EvaluationRelevance {
     pub record_id: Option<String>,
     #[serde(default = "default_relevance")]
     pub relevance: f32,
+    /// Verbatim spans expected in the rendered snippet for this record.
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 fn default_relevance() -> f32 {
     1.0
 }
 
-/// One JSONL retrieval evaluation case.  Use either `query` or `queries`, but
-/// not both; multi-query cases use the latter.
+/// Search filters applied to an evaluation case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationFilters {
+    pub project: Option<String>,
+    pub source: Option<SourceFilter>,
+    pub role: Option<String>,
+    pub session: Option<String>,
+    pub since: Option<String>,
+    pub until: Option<String>,
+}
+
+/// One JSONL retrieval evaluation case. Use either `query` or `queries`, but
+/// not both; multi-query cases use the latter. An empty `relevant` list denotes
+/// a deliberately judged no-answer case, for which no results should be returned.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationCase {
     #[serde(default)]
     pub id: Option<String>,
@@ -326,6 +343,8 @@ pub struct EvaluationCase {
     pub queries: Vec<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub filters: EvaluationFilters,
     pub relevant: Vec<EvaluationRelevance>,
 }
 
@@ -341,9 +360,6 @@ impl EvaluationCase {
             .unwrap_or_else(|| self.queries.clone());
         if views.is_empty() || views.iter().any(|query| query.trim().is_empty()) {
             bail!("evaluation case must contain a non-empty query or queries list");
-        }
-        if self.relevant.is_empty() {
-            bail!("evaluation case must contain at least one relevant result");
         }
         validate_relevance(&self.relevant)?;
         Ok(views)
@@ -361,6 +377,9 @@ pub fn validate_relevance(relevant: &[EvaluationRelevance]) -> Result<()> {
         }
         if !relevance.relevance.is_finite() || relevance.relevance < 0.0 {
             bail!("relevance values must be finite and non-negative");
+        }
+        if relevance.evidence.iter().any(|span| span.trim().is_empty()) {
+            bail!("evidence spans must be nonempty");
         }
     }
     Ok(())
@@ -412,6 +431,8 @@ impl EvaluationDataset {
 struct RelevanceMap {
     values: HashMap<ResultKey, f32>,
     legacy_values: HashMap<LegacyKey, f32>,
+    evidence: HashMap<ResultKey, HashSet<String>>,
+    legacy_evidence: HashMap<LegacyKey, HashSet<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -491,9 +512,32 @@ impl RelevanceMap {
                 legacy_values.insert(legacy_key, relevance);
             }
         }
+        let mut evidence = HashMap::<ResultKey, HashSet<String>>::new();
+        let mut legacy_evidence = HashMap::<LegacyKey, HashSet<String>>::new();
+        for entry in relevant {
+            if !entry.relevance.is_finite() || entry.relevance <= 0.0 {
+                continue;
+            }
+            let legacy_key = LegacyKey::from_entry(entry);
+            let stable_key = entry.record_id.as_ref().map(|record_id| ResultKey {
+                machine: entry.machine.clone(),
+                source: entry.source,
+                session_id: entry.session_id.clone(),
+                source_path: entry.source_path.clone(),
+                record_id: record_id.clone(),
+            });
+            let spans = if let Some(key) = stable_key.as_ref().or(stable_aliases.get(&legacy_key)) {
+                evidence.entry(key.clone()).or_default()
+            } else {
+                legacy_evidence.entry(legacy_key).or_default()
+            };
+            spans.extend(entry.evidence.iter().cloned());
+        }
         Self {
             values,
             legacy_values,
+            evidence,
+            legacy_evidence,
         }
     }
 
@@ -517,6 +561,131 @@ impl RelevanceMap {
 
 fn key_for_result(result: &LocatedRecord) -> ResultKey {
     ResultKey::from_record(result)
+}
+
+/// Ranked hits and the snippets actually presented by a search surface.
+#[derive(Debug)]
+pub struct EvaluationResults {
+    pub hits: Vec<LocatedRecord>,
+    pub snippets: Vec<String>,
+}
+
+/// Metrics for one case. Positive retrieval metrics are undefined for no-answer cases.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct CaseMetrics {
+    pub mrr_at_k: Option<f64>,
+    pub recall_at_k: Option<f64>,
+    pub ndcg_at_k: Option<f64>,
+    pub conversation_success_at_5: Option<f64>,
+    pub snippet_evidence_coverage: Option<f64>,
+    pub no_answer_correct: Option<bool>,
+    pub returned_results: usize,
+}
+
+/// Evaluate ranked results and their aligned rendered snippets.
+///
+/// Conversation success considers the first five distinct conversations in the
+/// supplied results, independent of the record cutoff `k`. Evidence coverage
+/// counts unique positive record/span judgments found verbatim in that record's
+/// snippet within the first `k` hits. Missing evidence judgments yield `None`.
+pub fn evaluate_case(
+    case: &EvaluationCase,
+    results: &[LocatedRecord],
+    snippets: &[String],
+    k: usize,
+) -> Result<CaseMetrics> {
+    if k == 0 {
+        bail!("evaluation cutoff k must be greater than zero");
+    }
+    if results.len() != snippets.len() {
+        bail!("evaluation snippets must align with results");
+    }
+    case.query_views()?;
+    let relevance = RelevanceMap::new(&case.relevant);
+    if relevance.positive_count() == 0 {
+        return Ok(CaseMetrics {
+            mrr_at_k: None,
+            recall_at_k: None,
+            ndcg_at_k: None,
+            conversation_success_at_5: None,
+            snippet_evidence_coverage: None,
+            no_answer_correct: Some(results.is_empty()),
+            returned_results: results.len(),
+        });
+    }
+    let relevant_conversations = case
+        .relevant
+        .iter()
+        .filter(|entry| entry.relevance > 0.0)
+        .map(|entry| {
+            (
+                entry.machine.as_str(),
+                entry.source,
+                entry.session_id.as_str(),
+                entry.source_path.as_str(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut seen_conversations = HashSet::new();
+    let conversation_success = results
+        .iter()
+        .map(|result| {
+            (
+                result.machine.as_str(),
+                result.record.source,
+                result.record.session_id.as_str(),
+                result.record.source_path.as_str(),
+            )
+        })
+        .filter(|key| seen_conversations.insert(*key))
+        .take(5)
+        .any(|key| relevant_conversations.contains(&key));
+
+    let mut total_evidence = 0;
+    let mut found_evidence = 0;
+    for (key, spans) in &relevance.evidence {
+        for span in spans {
+            total_evidence += 1;
+            if results
+                .iter()
+                .zip(snippets)
+                .take(k)
+                .any(|(result, snippet)| key_for_result(result) == *key && snippet.contains(span))
+            {
+                found_evidence += 1;
+            }
+        }
+    }
+    for (key, spans) in &relevance.legacy_evidence {
+        for span in spans {
+            total_evidence += 1;
+            if results
+                .iter()
+                .zip(snippets)
+                .take(k)
+                .any(|(result, snippet)| {
+                    !relevance.values.contains_key(&key_for_result(result))
+                        && LegacyKey::from_result(result) == *key
+                        && snippet.contains(span)
+                })
+            {
+                found_evidence += 1;
+            }
+        }
+    }
+    Ok(CaseMetrics {
+        mrr_at_k: Some(reciprocal_rank(
+            &results[..results.len().min(k)],
+            &case.relevant,
+        )),
+        recall_at_k: Some(recall_at_k(results, &case.relevant, k)),
+        ndcg_at_k: Some(ndcg_at_k(results, &case.relevant, k)),
+        conversation_success_at_5: Some(if conversation_success { 1.0 } else { 0.0 }),
+        snippet_evidence_coverage: (total_evidence > 0)
+            .then(|| found_evidence as f64 / total_evidence as f64),
+        no_answer_correct: None,
+        returned_results: results.len(),
+    })
 }
 
 /// Binary recall of the known relevant set in the first `k` results.
@@ -691,7 +860,141 @@ mod tests {
             doc_id: result.record.doc_id,
             record_id: None,
             relevance: value,
+            evidence: Vec::new(),
         }
+    }
+
+    fn evaluation_case(relevant: Vec<EvaluationRelevance>) -> EvaluationCase {
+        EvaluationCase {
+            id: None,
+            query: Some("foo".to_string()),
+            queries: Vec::new(),
+            cwd: None,
+            filters: EvaluationFilters::default(),
+            relevant,
+        }
+    }
+
+    #[test]
+    fn no_answer_cases_have_only_abstention_metrics() {
+        let case = evaluation_case(Vec::new());
+        let empty = evaluate_case(&case, &[], &[], 5).unwrap();
+        assert_eq!(empty.no_answer_correct, Some(true));
+        assert_eq!(empty.mrr_at_k, None);
+        assert_eq!(empty.recall_at_k, None);
+        assert_eq!(empty.ndcg_at_k, None);
+        assert_eq!(empty.conversation_success_at_5, None);
+        assert_eq!(empty.snippet_evidence_coverage, None);
+        assert_eq!(empty.returned_results, 0);
+        let hit = located("local", SourceKind::Codex, "s", "s.jsonl", 1, 1.0, 1);
+        let nonempty = evaluate_case(&case, &[hit], &["unrelated".into()], 5).unwrap();
+        assert_eq!(nonempty.no_answer_correct, Some(false));
+        assert_eq!(nonempty.returned_results, 1);
+        assert!(evaluate_case(&case, &[], &[], 0).is_err());
+        assert!(evaluate_case(&case, &[], &["extra".into()], 5).is_err());
+    }
+
+    #[test]
+    fn case_mrr_obeys_cutoff() {
+        let miss = located("local", SourceKind::Codex, "miss", "m.jsonl", 1, 1.0, 1);
+        let hit = located("local", SourceKind::Codex, "hit", "h.jsonl", 2, 1.0, 2);
+        let case = evaluation_case(vec![relevance(&hit, 1.0)]);
+        let results = vec![miss, hit];
+        let snippets = vec![String::new(); 2];
+        let metrics = evaluate_case(&case, &results, &snippets, 1).unwrap();
+        assert_eq!(metrics.mrr_at_k, Some(0.0));
+        assert_eq!(metrics.recall_at_k, Some(0.0));
+        assert_eq!(metrics.ndcg_at_k, Some(0.0));
+        assert_eq!(metrics.snippet_evidence_coverage, None);
+        assert_eq!(metrics.no_answer_correct, None);
+        let metrics = evaluate_case(&case, &results, &snippets, 2).unwrap();
+        assert_eq!(metrics.mrr_at_k, Some(0.5));
+        assert_eq!(metrics.recall_at_k, Some(1.0));
+    }
+
+    #[test]
+    fn conversation_success_deduplicates_before_cutoff_and_accepts_other_records() {
+        let relevant = located("local", SourceKind::Codex, "hit", "h.jsonl", 9, 1.0, 9);
+        let case = evaluation_case(vec![relevance(&relevant, 1.0)]);
+        let mut results = (1..=6)
+            .map(|id| located("local", SourceKind::Codex, "miss", "m.jsonl", id, 1.0, id))
+            .collect::<Vec<_>>();
+        results.push(located(
+            "local",
+            SourceKind::Codex,
+            "hit",
+            "h.jsonl",
+            8,
+            1.0,
+            8,
+        ));
+        let metrics = evaluate_case(&case, &results, &vec![String::new(); 7], 7).unwrap();
+        assert_eq!(metrics.conversation_success_at_5, Some(1.0));
+        assert_eq!(metrics.mrr_at_k, Some(0.0));
+
+        let mut distinct = (1..=5)
+            .map(|id| {
+                located(
+                    "local",
+                    SourceKind::Codex,
+                    &format!("s{id}"),
+                    "m.jsonl",
+                    id,
+                    1.0,
+                    id,
+                )
+            })
+            .collect::<Vec<_>>();
+        distinct.push(relevant);
+        let metrics = evaluate_case(&case, &distinct, &vec![String::new(); 6], 6).unwrap();
+        assert_eq!(metrics.conversation_success_at_5, Some(0.0));
+    }
+
+    #[test]
+    fn evidence_coverage_uses_rendered_snippet_and_matching_record() {
+        let mut hit = located("local", SourceKind::Codex, "s", "s.jsonl", 1, 1.0, 1);
+        hit.record.text = format!("{} late evidence", "unrelated prefix ".repeat(100));
+        let other = located("local", SourceKind::Codex, "s", "s.jsonl", 2, 1.0, 2);
+        let mut judgment = relevance(&hit, 1.0);
+        judgment.evidence = vec!["late evidence".into(), "missing evidence".into()];
+        let case = evaluation_case(vec![judgment]);
+        let results = vec![other, hit];
+        let snippets = vec!["missing evidence".into(), "… late evidence".into()];
+        assert_eq!(
+            evaluate_case(&case, &results, &snippets, 1)
+                .unwrap()
+                .snippet_evidence_coverage,
+            Some(0.0)
+        );
+        assert_eq!(
+            evaluate_case(&case, &results, &snippets, 2)
+                .unwrap()
+                .snippet_evidence_coverage,
+            Some(0.5)
+        );
+        let prefixes = vec!["missing evidence".into(), "unrelated prefix".into()];
+        assert_eq!(
+            evaluate_case(&case, &results, &prefixes, 2)
+                .unwrap()
+                .snippet_evidence_coverage,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn evidence_deduplicates_stable_legacy_aliases_and_survives_doc_id_changes() {
+        let mut hit = located("local", SourceKind::Codex, "s", "s.jsonl", 1, 1.0, 1);
+        hit.record.links.event_id = Some("stable-id".into());
+        let mut legacy = relevance(&hit, 1.0);
+        legacy.evidence = vec!["found".into(), "found".into()];
+        let mut stable = legacy.clone();
+        stable.record_id = Some(canonical_record_id(&hit.record));
+        stable.evidence.push("missing".into());
+        let case = evaluation_case(vec![legacy, stable]);
+        hit.record.doc_id = 99;
+        let metrics = evaluate_case(&case, &[hit], &["found".into()], 1).unwrap();
+        assert_eq!(metrics.recall_at_k, Some(1.0));
+        assert_eq!(metrics.snippet_evidence_coverage, Some(0.5));
     }
 
     #[test]
@@ -770,6 +1073,14 @@ mod tests {
         let valid = r#"{"id":"one","query":"foo","relevant":[{"machine":"local","source":"codex","session_id":"s","source_path":"s.jsonl","doc_id":1}]}"#;
         let dataset = EvaluationDataset::from_jsonl(valid).unwrap();
         assert_eq!(dataset.cases[0].query_views().unwrap(), vec!["foo"]);
+        assert_eq!(dataset.cases[0].filters, EvaluationFilters::default());
+        assert!(dataset.cases[0].relevant[0].evidence.is_empty());
+        let no_answer =
+            r#"{"query":"unknown","relevant":[],"filters":{"source":"codex","role":"user"}}"#;
+        let dataset = EvaluationDataset::from_jsonl(no_answer).unwrap();
+        assert!(dataset.cases[0].relevant.is_empty());
+        assert_eq!(dataset.cases[0].filters.source, Some(SourceFilter::Codex));
+        assert_eq!(dataset.cases[0].filters.role.as_deref(), Some("user"));
         let duplicate = format!("{valid}\n{valid}");
         assert!(EvaluationDataset::from_jsonl(&duplicate).is_err());
         let empty_query = r#"{"query":" ","relevant":[{"machine":"local","source":"codex","session_id":"s","source_path":"s.jsonl","doc_id":1}]}"#;
@@ -800,6 +1111,7 @@ mod tests {
             doc_id: first.record.doc_id,
             record_id: Some(canonical_record_id(&first.record)),
             relevance: 1.0,
+            evidence: Vec::new(),
         };
         let legacy = relevance(&first, 2.0);
         assert_eq!(recall_at_k(&[first], &[stable, legacy], 1), 1.0);
@@ -827,6 +1139,7 @@ mod tests {
             query: Some("foo".to_string()),
             queries: Vec::new(),
             cwd: None,
+            filters: EvaluationFilters::default(),
             relevant: vec![EvaluationRelevance {
                 machine: "local".to_string(),
                 source: SourceKind::Codex,
@@ -835,6 +1148,7 @@ mod tests {
                 doc_id: 1,
                 record_id: None,
                 relevance: 1.0,
+                evidence: Vec::new(),
             }],
         };
         assert!(mean_reciprocal_rank(&[], &[case]).is_err());

@@ -1474,6 +1474,47 @@ struct SnippetMatch {
     end: usize,
 }
 
+pub(crate) fn evaluate_search(
+    paths: &Paths,
+    query: &str,
+    project: Option<&str>,
+    source: Option<SourceFilter>,
+    origin: SessionKindFilter,
+    limit: usize,
+) -> Result<crate::retrieval_eval::EvaluationResults> {
+    anyhow::ensure!(!query.trim().is_empty(), "web evaluation requires a query");
+    let payload = search_payload(
+        paths,
+        &SearchRequest {
+            query: query.to_string(),
+            source,
+            project: project.map(str::to_string),
+            offset: 0,
+            limit,
+            origin,
+            range: TimeRange::All,
+            sort: SearchSort::Relevance,
+        },
+    )?;
+    let index = open_index(paths)?;
+    let mut hits = Vec::new();
+    let mut snippets = Vec::new();
+    for summary in payload.results {
+        let source = crate::types::SourceKind::from_label(&summary.source)
+            .ok_or_else(|| anyhow!("unknown result source: {}", summary.source))?;
+        let selector = crate::retrieval::ContextSelector::record_id(summary.record_id)
+            .with_scope(Some(summary.session_id), Some(source));
+        let record = crate::retrieval::resolve_record(&index, &selector)?;
+        hits.push(crate::machine::LocatedRecord {
+            machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
+            score: summary.score.unwrap_or_default(),
+            record,
+        });
+        snippets.push(summary.snippet);
+    }
+    Ok(crate::retrieval_eval::EvaluationResults { hits, snippets })
+}
+
 fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload> {
     let index = open_index(paths)?;
     let matchers = crate::cli::build_matchers(&params.query)?;
@@ -3072,6 +3113,90 @@ mod tests {
         assert!(
             ActivityRequest::from_url(&parse_url("/api/activity?origin=bots").unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn evaluation_search_preserves_grouped_winners_and_snippets() {
+        let temp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut tool = record(
+            2,
+            "session-a",
+            "/tmp/a.jsonl",
+            "needle needle tool output".to_string(),
+        );
+        tool.role = "tool".to_string();
+        let mut tool_only = record(
+            5,
+            "session-c",
+            "/tmp/c.jsonl",
+            "needle only available in tool output".to_string(),
+        );
+        tool_only.role = "tool".to_string();
+        publish_records(
+            &paths,
+            [
+                record(
+                    1,
+                    "session-a",
+                    "/tmp/a.jsonl",
+                    "background context".to_string(),
+                ),
+                tool,
+                record(
+                    3,
+                    "session-a",
+                    "/tmp/a.jsonl",
+                    "needle with a longer explanatory response".to_string(),
+                ),
+                record(
+                    4,
+                    "session-b",
+                    "/tmp/b.jsonl",
+                    "needle in another session with more context".to_string(),
+                ),
+                tool_only,
+            ],
+        );
+        let expected = search_payload(
+            &paths,
+            &SearchRequest {
+                query: "needle".to_string(),
+                source: Some(SourceFilter::Claude),
+                project: Some("memex".to_string()),
+                offset: 0,
+                limit: 20,
+                origin: SessionKindFilter::All,
+                range: TimeRange::All,
+                sort: SearchSort::Relevance,
+            },
+        )
+        .unwrap();
+        let actual = evaluate_search(
+            &paths,
+            "needle",
+            Some("memex"),
+            Some(SourceFilter::Claude),
+            SessionKindFilter::All,
+            20,
+        )
+        .unwrap();
+        assert_eq!(actual.hits.len(), 3);
+        assert!(actual.hits.iter().any(|hit| hit.record.role == "tool"));
+        for ((hit, snippet), summary) in actual
+            .hits
+            .iter()
+            .zip(&actual.snippets)
+            .zip(expected.results)
+        {
+            assert_eq!(
+                crate::retrieval::canonical_record_id(&hit.record),
+                summary.record_id
+            );
+            assert_eq!(Some(hit.score), summary.score);
+            assert_eq!(*snippet, summary.snippet);
+        }
     }
 
     #[test]

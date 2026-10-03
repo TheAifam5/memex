@@ -1,7 +1,7 @@
 use crate::analytics::{AnalyticsStore, analytics_path, backfill_from_index};
 use crate::config::{Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedRuntimeConfig, ModelChoice};
-use crate::index::{IndexRevision, QueryOptions, SearchIndex, SessionScopeKey};
+use crate::index::{IndexRevision, QueryOptions, SearchIndex};
 use crate::ingest::{IngestOptions, ingest_all, ingest_dirty};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
@@ -20,8 +20,7 @@ use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector};
 use crate::retrieval_eval::{
-    EvaluationDataset, RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace,
-    fuse_ranked_queries, mean_reciprocal_rank, ndcg_at_k, recall_at_k, unique_sessions_at_k,
+    RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace, fuse_ranked_queries,
 };
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
@@ -53,11 +52,12 @@ use std::time::Instant;
 use toml_edit::{DocumentMut, Item as TomlItem, value};
 
 mod daemon_upgrade;
+mod evaluation;
 mod stats;
 mod surface;
 use surface::{
-    CliSearchMode, DaemonMcpArgs, DebugCommand, IndexCommand, IndexSource, OutputArgs,
-    OutputFormat, OutputOptions, SessionCommand, WebCommand,
+    CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
+    OutputArgs, OutputFormat, OutputOptions, SessionCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -602,14 +602,8 @@ The input contains at most 32 requests; each page is limited to 500 records."
     /// Run retrieval queries from a JSONL evaluation dataset
     #[command(hide = true)]
     EvalRetrieval {
-        /// JSONL evaluation dataset path
-        dataset: PathBuf,
-        /// Cutoff used for recall and nDCG metrics
-        #[arg(long, default_value_t = 20)]
-        k: usize,
-        /// Path to memex data directory [default: ~/.memex]
-        #[arg(long)]
-        root: Option<PathBuf>,
+        #[command(flatten)]
+        evaluation: EvaluationArgs,
     },
     /// List this machine and enabled configured peers (without connecting)
     Machines {
@@ -1759,10 +1753,10 @@ pub fn run() -> Result<()> {
             })?;
         }
         Commands::Debug {
-            action: DebugCommand::EvalRetrieval { dataset, k, root },
+            action: DebugCommand::EvalRetrieval { evaluation },
         }
-        | Commands::EvalRetrieval { dataset, k, root } => {
-            run_eval_retrieval(dataset, k, root)?;
+        | Commands::EvalRetrieval { evaluation } => {
+            evaluation::run(evaluation)?;
         }
         Commands::Machines { root, output } => {
             let paths = Paths::new(root)?;
@@ -4611,83 +4605,6 @@ fn hydrate_error_value(machine: &str, request: &SessionPageRequest, error: &str)
     })?)
 }
 
-fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) -> Result<()> {
-    let dataset = EvaluationDataset::read_jsonl(&dataset_path)?;
-    let paths = Paths::new(root)?;
-    let index = SearchIndex::open_or_create(&paths.index)?;
-    let mut result_lists = Vec::with_capacity(dataset.cases.len());
-    for case in &dataset.cases {
-        let scope = case
-            .cwd
-            .as_deref()
-            .map(|cwd| session_scope_for_cwd(&paths, cwd))
-            .transpose()?
-            .flatten();
-        let mut ranked = Vec::new();
-        for query in case.query_views()? {
-            let options = QueryOptions {
-                query,
-                project: None,
-                role: None,
-                tool: None,
-                session_id: None,
-                session_scope: scope.clone(),
-                source: None,
-                since: None,
-                until: None,
-                limit: k.max(20),
-            };
-            ranked.push(
-                index
-                    .search(&options)?
-                    .into_iter()
-                    .map(|(score, record)| LocatedRecord {
-                        machine: crate::machine::LOCAL_MACHINE_ID.to_string(),
-                        score,
-                        record,
-                    })
-                    .collect(),
-            );
-        }
-        result_lists.push(fuse_ranked_queries(
-            ranked,
-            crate::retrieval_eval::DEFAULT_RRF_K,
-        ));
-    }
-    let mrr = mean_reciprocal_rank(&result_lists, &dataset.cases)?;
-    let ndcg = dataset
-        .cases
-        .iter()
-        .zip(&result_lists)
-        .map(|(case, results)| ndcg_at_k(results, &case.relevant, k))
-        .sum::<f64>()
-        / dataset.cases.len() as f64;
-    let recall = dataset
-        .cases
-        .iter()
-        .zip(&result_lists)
-        .map(|(case, results)| recall_at_k(results, &case.relevant, k))
-        .sum::<f64>()
-        / dataset.cases.len() as f64;
-    let unique_sessions = result_lists
-        .iter()
-        .map(|results| unique_sessions_at_k(results, k))
-        .sum::<usize>() as f64
-        / dataset.cases.len() as f64;
-    println!(
-        "{}",
-        serde_json::json!({
-            "cases": dataset.cases.len(),
-            "k": k,
-            "mrr": mrr,
-            "recall_at_k": recall,
-            "ndcg_at_k": ndcg,
-            "mean_unique_sessions_at_k": unique_sessions,
-        })
-    );
-    Ok(())
-}
-
 struct SessionRunArgs {
     session_id: String,
     machine: String,
@@ -5377,24 +5294,6 @@ pub(crate) fn canonical_cwd_filter(cwd: Option<PathBuf>) -> Option<String> {
     let cwd = cwd?;
     let resolved = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     Some(resolved.to_string_lossy().to_string())
-}
-
-fn session_scope_for_cwd(paths: &Paths, cwd: &str) -> Result<Option<Vec<SessionScopeKey>>> {
-    let db = analytics_path(&paths.state);
-    if !db.exists() {
-        return Ok(Some(Vec::new()));
-    }
-    let store = AnalyticsStore::open_read_only(db)?;
-    let rows = store.query_sessions_detailed(None, None, Some(cwd), None, None)?;
-    Ok(Some(
-        rows.into_iter()
-            .map(|row| SessionScopeKey {
-                source: row.source,
-                session_id: row.session_id,
-                source_path: row.source_path,
-            })
-            .collect(),
-    ))
 }
 
 struct TraceWriteArgs<'a> {
@@ -10300,11 +10199,11 @@ arguments = {
 
         let eval = Cli::try_parse_from(["memex", "eval-retrieval", "dataset.jsonl", "--k", "50"])
             .expect("parse retrieval evaluation command");
-        let Some(Commands::EvalRetrieval { dataset, k, .. }) = eval.command else {
+        let Some(Commands::EvalRetrieval { evaluation }) = eval.command else {
             panic!("expected eval-retrieval command");
         };
-        assert_eq!(dataset, PathBuf::from("dataset.jsonl"));
-        assert_eq!(k, 50);
+        assert_eq!(evaluation.dataset, PathBuf::from("dataset.jsonl"));
+        assert_eq!(evaluation.k, 50);
     }
 
     #[test]

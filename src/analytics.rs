@@ -2254,6 +2254,42 @@ pub fn rebuild_from_records(
     writer.prepare().replace_all_and_mark_complete()
 }
 
+/// Portable record and explicit repository grouping fact for an evaluation snapshot.
+#[derive(Deserialize)]
+pub(crate) struct SnapshotRecord {
+    #[serde(flatten)]
+    pub record: Record,
+    pub repo_project: Option<String>,
+}
+
+/// Evaluation snapshots own their session facts; do not enrich them from source files or Git.
+pub(crate) fn rebuild_from_snapshot(
+    path: impl AsRef<Path>,
+    records: impl IntoIterator<Item = SnapshotRecord>,
+) -> Result<()> {
+    let mut writer = AnalyticsWriter::open(path)?;
+    for SnapshotRecord {
+        record,
+        repo_project,
+    } in records
+    {
+        writer
+            .metadata_cache
+            .entry(SessionKey {
+                source: record.source,
+                session_id: record.session_id.clone(),
+                source_path: record.source_path.clone(),
+            })
+            .or_insert_with(|| SessionMetadata {
+                resolution_status: "snapshot".into(),
+                repo_project,
+                ..SessionMetadata::default()
+            });
+        writer.record(&record)?;
+    }
+    writer.prepare().replace_all_and_mark_complete()
+}
+
 pub fn backfill_from_index(
     path: impl AsRef<Path>,
     index: &crate::index::SearchIndex,
@@ -2561,6 +2597,46 @@ mod tests {
             "sidequery-backend"
         );
         assert_eq!(display_project_name("model-serving"), "model-serving");
+    }
+
+    #[test]
+    fn evaluation_snapshot_does_not_follow_host_source_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("session.jsonl");
+        fs::write(
+            &source,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .unwrap();
+        let input = record("snapshot-project", "s1", &source, 10);
+        let ordinary = tmp.path().join("ordinary.sqlite");
+        rebuild_from_records(&ordinary, [input.clone()]).unwrap();
+        let snapshot = tmp.path().join("snapshot.sqlite");
+        rebuild_from_snapshot(
+            &snapshot,
+            [SnapshotRecord {
+                record: input,
+                repo_project: Some("snapshot-repository".into()),
+            }],
+        )
+        .unwrap();
+        let rows = |db| {
+            AnalyticsStore::open_read_only(db)
+                .unwrap()
+                .query_sessions_detailed(None, None, None, None, None)
+                .unwrap()
+        };
+        assert!(rows(ordinary)[0].cwd.is_some());
+        let isolated = rows(snapshot);
+        assert_eq!(isolated[0].project, "snapshot-project");
+        assert!(isolated[0].cwd.is_none());
+        assert_eq!(
+            isolated[0].repo_project.as_deref(),
+            Some("snapshot-repository")
+        );
     }
 
     #[test]

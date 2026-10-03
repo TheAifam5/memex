@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
@@ -354,6 +355,40 @@ impl VectorIndex {
 
     pub fn exists(dir: &Path) -> bool {
         dir.join(CURRENT_GENERATION_FILE).exists() || dir.join("usearch.index").exists()
+    }
+
+    /// Identify published storage without loading the vector index. Published generations
+    /// are immutable; legacy flat storage needs content hashes because it has no generation.
+    pub(crate) fn snapshot_revision(dir: &Path) -> Result<Option<String>> {
+        let Some(storage) = active_storage(dir)? else {
+            return Ok(None);
+        };
+        if let Some(generation) = storage.generation {
+            for name in ["usearch.index", "doc_ids.bin", "meta.json"] {
+                if !storage.path.join(name).is_file() {
+                    return Err(anyhow!("vector snapshot file missing: {name}"));
+                }
+            }
+            return Ok(Some(generation));
+        }
+        let mut hash = Sha256::new();
+        for name in ["usearch.index", "doc_ids.bin", "meta.json"] {
+            hash.update(name.as_bytes());
+            match fs::read(storage.path.join(name)) {
+                Ok(bytes) => {
+                    hash.update([1]);
+                    hash.update((bytes.len() as u64).to_le_bytes());
+                    hash.update(bytes);
+                }
+                Err(error)
+                    if name == "meta.json" && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    hash.update([0]);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(Some(format!("legacy-{:x}", hash.finalize())))
     }
 
     pub fn inventory(dir: &Path) -> Result<Option<VectorInventory>> {
@@ -1061,6 +1096,43 @@ mod tests {
         assert!(tmp.path().join(CURRENT_GENERATION_FILE).is_file());
         assert!(!tmp.path().join("usearch.index").exists());
         assert!(VectorIndex::open(tmp.path()).unwrap().contains(1));
+    }
+
+    #[test]
+    fn snapshot_revision_detects_legacy_vector_replacement_with_same_ids_and_model() {
+        let tmp = TempDir::new().unwrap();
+        let mut index = VectorIndex::open_or_create(tmp.path(), 2, Some("fixture")).unwrap();
+        index.add(1, &[1.0, 0.0]).unwrap();
+        index.save().unwrap();
+        let generation = active_dir(tmp.path());
+        for name in ["usearch.index", "doc_ids.bin", "meta.json"] {
+            fs::rename(generation.join(name), tmp.path().join(name)).unwrap();
+        }
+        fs::remove_file(tmp.path().join(CURRENT_GENERATION_FILE)).unwrap();
+        let original = VectorIndex::snapshot_revision(tmp.path()).unwrap().unwrap();
+        assert_eq!(
+            VectorIndex::snapshot_revision(tmp.path()).unwrap(),
+            Some(original.clone())
+        );
+
+        let replacement_root = TempDir::new().unwrap();
+        let mut replacement =
+            VectorIndex::open_or_create(replacement_root.path(), 2, Some("fixture")).unwrap();
+        replacement.add(1, &[0.0, 1.0]).unwrap();
+        replacement.save().unwrap();
+        fs::copy(
+            active_dir(replacement_root.path()).join("usearch.index"),
+            tmp.path().join("usearch.index"),
+        )
+        .unwrap();
+        assert_ne!(
+            VectorIndex::snapshot_revision(tmp.path()).unwrap().unwrap(),
+            original
+        );
+        assert_eq!(
+            VectorIndex::open(tmp.path()).unwrap().model(),
+            Some("fixture")
+        );
     }
 
     #[test]

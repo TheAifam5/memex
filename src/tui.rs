@@ -518,6 +518,8 @@ impl SourceChoice {
 
 #[derive(Clone, Debug)]
 struct SessionSummary {
+    best_record_id: Option<String>,
+    best_record_source: Option<SourceKind>,
     machine: String,
     session_id: String,
     project: String,
@@ -5418,6 +5420,8 @@ fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Optio
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
     SessionSummary {
+        best_record_id: None,
+        best_record_source: None,
         machine: LOCAL_MACHINE_ID.to_string(),
         session_id: row.session_id,
         project: row.display_project,
@@ -5600,6 +5604,8 @@ fn add_record_to_session(
     let entry = sessions
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
+            best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+            best_record_source: Some(record.source),
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: record.session_id.clone(),
             project: record.project.clone(),
@@ -5628,6 +5634,8 @@ fn add_record_to_session(
     }
     if score >= entry.top_score {
         entry.top_score = score;
+        entry.best_record_id = Some(crate::retrieval::canonical_record_id(&record));
+        entry.best_record_source = Some(record.source);
         let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
@@ -5653,6 +5661,8 @@ fn add_located_record_to_session(
         record.source_path
     );
     let entry = sessions.entry(key).or_insert(SessionSummary {
+        best_record_id: Some(crate::retrieval::canonical_record_id(&record)),
+        best_record_source: Some(record.source),
         machine,
         session_id: record.session_id.clone(),
         project: record.project.clone(),
@@ -5679,6 +5689,8 @@ fn add_located_record_to_session(
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
+        entry.best_record_id = Some(crate::retrieval::canonical_record_id(&record));
+        entry.best_record_source = Some(record.source);
         let snippet = crate::cli::match_preview(&record.text, matchers, 160);
         if !snippet.is_empty() {
             entry.snippet = snippet;
@@ -5719,6 +5731,71 @@ fn spawn_search_worker(
             }
         }
     });
+}
+
+pub(crate) fn evaluate_search(
+    paths: &Paths,
+    query: &str,
+    project: Option<&str>,
+    source: Option<SourceFilter>,
+    origin: crate::analytics::SessionKindFilter,
+    limit: usize,
+) -> Result<crate::retrieval_eval::EvaluationResults> {
+    anyhow::ensure!(!query.trim().is_empty(), "TUI evaluation requires a query");
+    anyhow::ensure!(
+        limit <= RESULT_LIMIT,
+        "TUI evaluation limit cannot exceed {RESULT_LIMIT}"
+    );
+    let config = UserConfig::load(paths)?;
+    let index = open_tui_index(paths, false)?;
+    let source = source
+        .map(|source| {
+            SourceKind::from_label(source.as_str())
+                .map(SourceChoice::from_source)
+                .ok_or_else(|| anyhow::anyhow!("unsupported TUI source: {}", source.as_str()))
+        })
+        .transpose()?
+        .unwrap_or(SourceChoice::All);
+    let (sessions, failures) = run_search_request(
+        paths,
+        &config,
+        &index,
+        SearchRequest {
+            request_id: 0,
+            query: query.to_string(),
+            project: project.unwrap_or_default().to_string(),
+            machines: Vec::new(),
+            source,
+            since: None,
+            grouping: ProjectDisplayMode::NestedWorktrees.grouping(),
+            kind: origin,
+        },
+    )?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "TUI evaluation search failed on machines: {failures:?}"
+    );
+    let mut hits = Vec::new();
+    let mut snippets = Vec::new();
+    for session in sessions.into_iter().take(limit) {
+        let id = session
+            .best_record_id
+            .ok_or_else(|| anyhow::anyhow!("TUI search result has no representative record"))?;
+        let selector = crate::retrieval::ContextSelector::record_id(id)
+            .with_scope(Some(session.session_id), session.best_record_source);
+        let record = if session.machine == LOCAL_MACHINE_ID {
+            crate::retrieval::resolve_record(&index, &selector)?
+        } else {
+            crate::machine::record_by_selector(paths, &config, &session.machine, &selector)?
+        };
+        hits.push(crate::machine::LocatedRecord {
+            machine: session.machine,
+            score: session.top_score,
+            record,
+        });
+        snippets.push(session.snippet);
+    }
+    Ok(crate::retrieval_eval::EvaluationResults { hits, snippets })
 }
 
 fn run_search_request(
@@ -7411,6 +7488,8 @@ mod tests {
         )
         .expect("write transcript");
         let session = SessionSummary {
+            best_record_id: None,
+            best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
             project: "repo".to_string(),
@@ -7471,6 +7550,84 @@ mod tests {
     }
 
     #[test]
+    fn evaluation_search_preserves_grouped_winners_and_snippets() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (id, session, role, text) in [
+            (1, "session-a", "assistant", "background context"),
+            (2, "session-a", "tool", "needle needle tool output"),
+            (
+                3,
+                "session-a",
+                "assistant",
+                "needle with a longer explanatory response",
+            ),
+            (
+                4,
+                "session-b",
+                "assistant",
+                "needle in another session with more context",
+            ),
+            (
+                5,
+                "session-c",
+                "tool",
+                "needle only available in tool output",
+            ),
+        ] {
+            let mut hit = record(role, text);
+            hit.doc_id = id;
+            hit.turn_id = id as u32;
+            hit.ts = id;
+            hit.session_id = session.to_string();
+            index.add_record(&mut writer, &hit).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        let index = open_tui_index(&paths, false).unwrap();
+        let (expected, failures) = run_search_request(
+            &paths,
+            &UserConfig::default(),
+            &index,
+            SearchRequest {
+                request_id: 0,
+                query: "needle".to_string(),
+                project: String::new(),
+                machines: Vec::new(),
+                source: SourceChoice::Codex,
+                since: None,
+                grouping: ProjectDisplayMode::NestedWorktrees.grouping(),
+                kind: crate::analytics::SessionKindFilter::All,
+            },
+        )
+        .unwrap();
+        assert!(failures.is_empty());
+        let actual = evaluate_search(
+            &paths,
+            "needle",
+            None,
+            Some(SourceFilter::Codex),
+            crate::analytics::SessionKindFilter::All,
+            20,
+        )
+        .unwrap();
+        assert_eq!(actual.hits.len(), 3);
+        assert!(actual.hits.iter().any(|hit| hit.record.role == "tool"));
+        for ((hit, snippet), summary) in actual.hits.iter().zip(&actual.snippets).zip(expected) {
+            assert_eq!(
+                Some(crate::retrieval::canonical_record_id(&hit.record)),
+                summary.best_record_id
+            );
+            assert_eq!(hit.score, summary.top_score);
+            assert_eq!(*snippet, summary.snippet);
+        }
+    }
+
+    #[test]
     fn grouped_search_previews_keep_late_matches_visible() {
         let theme = Theme::new();
         let matchers = crate::cli::build_matchers("fireduck").unwrap();
@@ -7482,7 +7639,9 @@ mod tests {
                     "{} {word} matching output",
                     "Script completed 日志 ".repeat(100)
                 );
-                let hit = record("tool", &text);
+                let mut hit = record("tool", &text);
+                hit.turn_id = score as u32;
+                let expected_id = crate::retrieval::canonical_record_id(&hit);
                 if federated {
                     add_located_record_to_session(
                         &mut sessions,
@@ -7497,6 +7656,10 @@ mod tests {
                     add_record_to_session(&mut sessions, score, hit, &matchers);
                 }
                 let summary = sessions.values().next().unwrap();
+                assert_eq!(
+                    summary.best_record_id.as_deref(),
+                    Some(expected_id.as_str())
+                );
                 assert!(summary.snippet.contains(word));
                 assert!(summary.snippet.chars().count() <= 160);
                 let spans = match_context_spans(&summary.snippet, &matchers, 50, &theme);
@@ -7783,6 +7946,8 @@ mod tests {
     #[test]
     fn recent_session_row_shows_title_instead_of_uuid() {
         let session = SessionSummary {
+            best_record_id: None,
+            best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
             project: "memex".to_string(),
@@ -7818,6 +7983,8 @@ mod tests {
         );
 
         let session = SessionSummary {
+            best_record_id: None,
+            best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
             project: "BenchBox".to_string(),
@@ -7852,6 +8019,8 @@ mod tests {
     fn enter_browse_switches_to_split_and_selects_first() {
         let (_tmp, mut app) = test_app();
         app.results.push(SessionSummary {
+            best_record_id: None,
+            best_record_source: None,
             machine: LOCAL_MACHINE_ID.to_string(),
             session_id: "session".to_string(),
             project: "project".to_string(),
@@ -8005,6 +8174,8 @@ mod tests {
         app.handle_search_update(SearchUpdate::Results {
             request_id: 3,
             sessions: vec![SessionSummary {
+                best_record_id: None,
+                best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "session".to_string(),
                 project: "project".to_string(),
@@ -8192,6 +8363,8 @@ mod tests {
     fn token_session_filter_uses_accepted_source_qualified_results() {
         let sessions = vec![
             SessionSummary {
+                best_record_id: None,
+                best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
                 project: "memex".into(),
@@ -8207,6 +8380,8 @@ mod tests {
                 conversation_kind: None,
             },
             SessionSummary {
+                best_record_id: None,
+                best_record_source: None,
                 machine: LOCAL_MACHINE_ID.to_string(),
                 session_id: "shared".into(),
                 project: "memex".into(),
@@ -8222,6 +8397,8 @@ mod tests {
                 conversation_kind: None,
             },
             SessionSummary {
+                best_record_id: None,
+                best_record_source: None,
                 machine: "mini".into(),
                 session_id: "shared".into(),
                 project: "memex".into(),

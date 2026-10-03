@@ -24,7 +24,10 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
 use tantivy::merge_policy::{LogMergePolicy, NoMergePolicy};
-use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, EmptyQuery, Occur, Query, RangeQuery,
+    TermQuery,
+};
 use tantivy::schema::Value;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder,
@@ -1242,7 +1245,7 @@ impl SearchIndex {
         crate::profiling::span!("lexical.search");
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let query = build_query(&self.fields, options, &self.index)?;
+        let query = build_relevance_query(&self.fields, options, &self.index)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(options.limit))?;
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
@@ -2710,6 +2713,85 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     })
 }
 
+/// Prefer conversational evidence without removing useful tool results. Full-query
+/// coverage rewards conversational text, rather than echoed tool invocations.
+fn build_relevance_query(
+    fields: &IndexFields,
+    options: &QueryOptions,
+    index: &Index,
+) -> Result<Box<dyn Query>> {
+    use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
+    let base = build_query(fields, options, index)?;
+    if options.query.trim().is_empty() || options.role.is_some() || options.tool.is_some() {
+        return Ok(base);
+    }
+    let conversation_roles = BooleanQuery::new(
+        ["user", "assistant"]
+            .into_iter()
+            .map(|role| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(fields.role, role),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect(),
+    );
+    let role_filter: Box<dyn Query> =
+        Box::new(ConstScoreQuery::new(Box::new(conversation_roles), 0.0));
+    // Add half of the original BM25 score for conversational matches. Role terms
+    // contribute no score, so rare roles cannot dominate the text's relevance.
+    let conversation_match = BooleanQuery::new(vec![
+        (Occur::Must, base.box_clone()),
+        (Occur::Must, role_filter.box_clone()),
+    ]);
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+        (Occur::Must, base),
+        (
+            Occur::Should,
+            Box::new(BoostQuery::new(Box::new(conversation_match), 0.5)),
+        ),
+    ];
+    let Ok(UserInputAst::Clause(children)) = tantivy::query_grammar::parse_query(&options.query)
+    else {
+        return Ok(Box::new(BooleanQuery::new(clauses)));
+    };
+    let plain_terms = children.len() > 1
+        && children.iter().all(|(occur, child)| {
+            if occur.is_some() {
+                return false;
+            }
+            let UserInputAst::Leaf(leaf) = child else {
+                return false;
+            };
+            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
+                return false;
+            };
+            literal.field_name.is_none()
+                && literal.delimiter == Delimiter::None
+                && literal.slop == 0
+                && !literal.prefix
+        });
+    if !plain_terms {
+        return Ok(Box::new(BooleanQuery::new(clauses)));
+    }
+    let mut parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
+    parser.set_conjunction_by_default();
+    let all_terms = BooleanQuery::new(vec![
+        (Occur::Must, parser.parse_query(&options.query)?),
+        (Occur::Must, role_filter),
+    ]);
+    // A full-query match gets its own BM25 contribution in addition to OR retrieval.
+    // This operates before TopDocs truncation, so grouping can see those candidates.
+    clauses.push((
+        Occur::Should,
+        Box::new(BoostQuery::new(Box::new(all_terms), 2.0)),
+    ));
+    Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
 fn build_query(
     fields: &IndexFields,
     options: &QueryOptions,
@@ -4147,6 +4229,81 @@ mod tests {
         assert_eq!(search_text_count(&index, "migrated"), 1);
         assert_eq!(search_text_count(&index, "Databases"), 1);
         assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn relevance_prefers_full_query_coverage_before_the_candidate_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for record in [
+            test_record(1, "museum museum museum museum museum"),
+            test_record(
+                2,
+                "The museum repaired the amber moth exhibit using a reversible resin patch and careful conservation techniques.",
+            ),
+            test_record(3, "moth"),
+        ] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: "museum amber moth".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.limit = 10;
+        assert_eq!(index.search(&options).unwrap().len(), 3);
+        options.query = "museum -amber".into();
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 1);
+        options.query = "\"amber moth\"".into();
+        assert_eq!(index.search(&options).unwrap().len(), 1);
+        options.query = "museum".into();
+        options.role = Some("assistant".into());
+        assert!(index.search(&options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn relevance_prefers_conversation_text_but_keeps_explicit_tool_searches() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for (id, role) in [(1, "assistant"), (2, "tool_use"), (3, "tool_result")] {
+            let mut record = test_record(id, "AURORA17 is a blue ceramic bowl.");
+            record.role = role.into();
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: "AURORA17".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 10,
+        };
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].1.doc_id, 1);
+        assert!(hits[0].0 > hits[1].0);
+        options.role = Some("tool_result".into());
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.doc_id, 3);
     }
 
     #[test]

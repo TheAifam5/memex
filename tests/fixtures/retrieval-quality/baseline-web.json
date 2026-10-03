@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "configuration": {
+    "surface": "web",
+    "mode": "lexical",
+    "k": 10,
+    "limit": 20,
+    "origin": "regular",
+    "unique_session": false,
+    "recency_weight": 0.0,
+    "recency_half_life_days": 30.0,
+    "vector_model": null,
+    "dataset_sha256": "2ef769d87a9f9cafba9b829bacd1a882468d434f3bf156a3b8ff3c72d4b885f5",
+    "records_sha256": "46bc7a5083548782ee897a67c470223f17cec725732e6a5131ff55634cbf37e5",
+    "live_index_revision": null,
+    "machines": [
+      "local"
+    ]
+  },
+  "index_changed_during_run": false,
+  "per_case": [
+    {
+      "id": "artifact-identifier",
+      "metrics": {
+        "mrr_at_k": 1.0,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "conversation_success_at_5": 1.0,
+        "snippet_evidence_coverage": 1.0,
+        "no_answer_correct": null,
+        "returned_results": 2
+      },
+      "recall_at_20": 1.0
+    },
+    {
+      "id": "quoted-caption",
+      "metrics": {
+        "mrr_at_k": 1.0,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "conversation_success_at_5": 1.0,
+        "snippet_evidence_coverage": 1.0,
+        "no_answer_correct": null,
+        "returned_results": 1
+      },
+      "recall_at_20": 1.0
+    },
+    {
+      "id": "project-scope",
+      "metrics": {
+        "mrr_at_k": 1.0,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "conversation_success_at_5": 1.0,
+        "snippet_evidence_coverage": 1.0,
+        "no_answer_correct": null,
+        "returned_results": 1
+      },
+      "recall_at_20": 1.0
+    },
+    {
+      "id": "late-evidence",
+      "metrics": {
+        "mrr_at_k": 1.0,
+        "recall_at_k": 1.0,
+        "ndcg_at_k": 1.0,
+        "conversation_success_at_5": 1.0,
+        "snippet_evidence_coverage": 0.0,
+        "no_answer_correct": null,
+        "returned_results": 1
+      },
+      "recall_at_20": 1.0
+    },
+    {
+      "id": "compound-identifier",
+      "metrics": {
+        "mrr_at_k": 0.0,
+        "recall_at_k": 0.0,
+        "ndcg_at_k": -0.0,
+        "conversation_success_at_5": 0.0,
+        "snippet_evidence_coverage": 0.0,
+        "no_answer_correct": null,
+        "returned_results": 1
+      },
+      "recall_at_20": 0.0
+    },
+    {
+      "id": "absent-identifier",
+      "metrics": {
+        "mrr_at_k": null,
+        "recall_at_k": null,
+        "ndcg_at_k": null,
+        "conversation_success_at_5": null,
+        "snippet_evidence_coverage": null,
+        "no_answer_correct": true,
+        "returned_results": 0
+      },
+      "recall_at_20": null
+    },
+    {
+      "id": "absent-natural-language",
+      "metrics": {
+        "mrr_at_k": null,
+        "recall_at_k": null,
+        "ndcg_at_k": null,
+        "conversation_success_at_5": null,
+        "snippet_evidence_coverage": null,
+        "no_answer_correct": false,
+        "returned_results": 2
+      },
+      "recall_at_20": null
+    }
+  ]
+}

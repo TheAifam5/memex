@@ -90,7 +90,7 @@ jobs:
       - name: Build
         run: mbx build --verbose
 
-      - name: Run unit and integration tests
+      - name: Run unit, integration, and lexical relevance regression tests
         timeout-minutes: 10
         run: mbx test --verbose -- --test-threads=1
 
